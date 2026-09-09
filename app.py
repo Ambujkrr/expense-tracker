@@ -28,6 +28,10 @@ def get_db_connection():
 # HOME / DASHBOARD
 # =====================================================
 
+@app.route("/ping")
+def ping():
+    return "OK"
+
 @app.route("/")
 def home():
 
