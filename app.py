@@ -57,22 +57,6 @@ def home():
     )
 
     # =================================================
-    # GET CATEGORIES
-    # =================================================
-
-    cursor.execute("""
-        SELECT
-            id,
-            name,
-            monthly_budget
-        FROM categories
-        ORDER BY name
-    """)
-
-    categories = cursor.fetchall()
-
-
-    # =================================================
     # GET EXPENSES
     # =================================================
 
@@ -92,23 +76,15 @@ def home():
 
     params = []
 
-
     if category_id:
-
         query += " AND e.category_id = %s"
-
         params.append(category_id)
 
-
     if month:
-
         query += " AND DATE_FORMAT(e.expense_date, '%Y-%m') = %s"
-
         params.append(month)
 
-
     query += " ORDER BY e.expense_date DESC"
-
 
     cursor.execute(
         query,
@@ -119,152 +95,56 @@ def home():
 
 
     # =================================================
-    # TOTAL SPENDING
+    # CALCULATE TOTAL AND COUNT IN PYTHON
     # =================================================
 
-    total_query = """
-        SELECT
-            COALESCE(SUM(e.amount), 0) AS total
-        FROM expenses e
-        WHERE 1=1
-    """
-
-    total_params = []
-
-
-    if category_id:
-
-        total_query += " AND e.category_id = %s"
-
-        total_params.append(category_id)
-
-
-    if month:
-
-        total_query += " AND DATE_FORMAT(e.expense_date, '%Y-%m') = %s"
-
-        total_params.append(month)
-
-
-    cursor.execute(
-        total_query,
-        total_params
+    total_spending = sum(
+        float(expense["amount"])
+        for expense in expenses
     )
 
-
-    total_result = cursor.fetchone()
-
-    total_spending = float(
-        total_result["total"]
-    )
-
-
-    # =================================================
-    # EXPENSE COUNT
-    # =================================================
-
-    count_query = """
-        SELECT
-            COUNT(*) AS total_count
-        FROM expenses e
-        WHERE 1=1
-    """
-
-    count_params = []
-
-
-    if category_id:
-
-        count_query += " AND e.category_id = %s"
-
-        count_params.append(category_id)
-
-
-    if month:
-
-        count_query += " AND DATE_FORMAT(e.expense_date, '%Y-%m') = %s"
-
-        count_params.append(month)
-
-
-    cursor.execute(
-        count_query,
-        count_params
-    )
-
-
-    count_result = cursor.fetchone()
-
-    expense_count = count_result["total_count"]
+    expense_count = len(expenses)
 
 
     # =================================================
     # CATEGORY-WISE SPENDING
     # =================================================
 
-    category_query = """
-        SELECT
-            c.name AS category,
-            COALESCE(SUM(e.amount), 0) AS total
-        FROM expenses e
-        JOIN categories c
-            ON e.category_id = c.id
-        WHERE 1=1
-    """
+    category_totals = {}
 
-    category_params = []
+    for expense in expenses:
 
+        category_name = expense["category"]
 
-    if category_id:
-
-        category_query += " AND e.category_id = %s"
-
-        category_params.append(category_id)
-
-
-    if month:
-
-        category_query += " AND DATE_FORMAT(e.expense_date, '%Y-%m') = %s"
-
-        category_params.append(month)
-
-
-    category_query += """
-        GROUP BY
-            c.id,
-            c.name
-        ORDER BY total DESC
-    """
-
-
-    cursor.execute(
-        category_query,
-        category_params
-    )
-
-
-    category_summary = cursor.fetchall()
-
-
-    for item in category_summary:
-
-        item["total"] = float(
-            item["total"]
+        category_totals[category_name] = (
+            category_totals.get(category_name, 0)
+            + float(expense["amount"])
         )
+
+    category_summary = [
+        {
+            "category": category_name,
+            "total": round(total, 2)
+        }
+        for category_name, total in category_totals.items()
+    ]
+
+    category_summary.sort(
+        key=lambda item: item["total"],
+        reverse=True
+    )
 
 
     # =================================================
     # MONTHLY SPENDING
     # =================================================
-    #
-    # IMPORTANT:
+
     # We intentionally do NOT apply the selected
     # month filter here.
     #
     # The ML model needs historical monthly data.
     #
     # Category filter is still respected.
-    # =================================================
 
     monthly_query = """
         SELECT
@@ -276,13 +156,9 @@ def home():
 
     monthly_params = []
 
-
     if category_id:
-
         monthly_query += " AND e.category_id = %s"
-
         monthly_params.append(category_id)
-
 
     monthly_query += """
         GROUP BY
@@ -290,25 +166,69 @@ def home():
         ORDER BY month
     """
 
-
     cursor.execute(
         monthly_query,
         monthly_params
     )
 
-
     monthly_summary = cursor.fetchall()
 
-
     for item in monthly_summary:
+        item["total"] = float(item["total"])
 
-        item["total"] = float(
-            item["total"]
-        )
+
+    # =================================================
+    # CATEGORIES + BUDGET ANALYSIS
+    # =================================================
+
+    budget_start = time.perf_counter()
+
+    budget_month = month
+
+    if not budget_month:
+        budget_month = datetime.now().strftime("%Y-%m")
+
+    budget_query = """
+        SELECT
+            c.id,
+            c.name AS category,
+            c.monthly_budget AS budget,
+            COALESCE(SUM(e.amount), 0) AS actual
+        FROM categories c
+        LEFT JOIN expenses e
+            ON c.id = e.category_id
+            AND DATE_FORMAT(e.expense_date, '%Y-%m') = %s
+        GROUP BY
+            c.id,
+            c.name,
+            c.monthly_budget
+        ORDER BY c.id
+    """
+
+    cursor.execute(
+        budget_query,
+        (budget_month,)
+    )
+
+    budget_summary = cursor.fetchall()
+
+    categories = []
+
+    for item in budget_summary:
+
+        item["budget"] = float(item["budget"])
+        item["actual"] = float(item["actual"])
+
+        categories.append({
+            "id": item["id"],
+            "name": item["category"],
+            "monthly_budget": item["budget"]
+        })
+    categories.sort(key=lambda item: item["name"].lower())
     print(
-    f"[PERF] Main database queries: "
-    f"{time.perf_counter() - db_start:.3f}s",
-    flush=True
+        f"[PERF] Main database queries: "
+        f"{time.perf_counter() - db_start:.3f}s",
+        flush=True
     )
 
 
