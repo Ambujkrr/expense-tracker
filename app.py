@@ -1,6 +1,7 @@
 from flask import Flask, render_template, request, redirect
 import mysql.connector
 import os
+import time
 from datetime import datetime
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error
@@ -32,6 +33,7 @@ def get_db_connection():
 @app.route("/")
 def home():
 
+    request_start = time.perf_counter()
     category_id = request.args.get("category_id")
     month = request.args.get("month")
 
@@ -40,9 +42,16 @@ def home():
     # CONNECT TO DATABASE
     # =================================================
 
+    db_start = time.perf_counter()
+
     db = get_db_connection()
     cursor = db.cursor(dictionary=True)
 
+    print(
+        f"[PERF] Database connection: "
+        f"{time.perf_counter() - db_start:.3f}s",
+        flush=True
+    )
 
     # =================================================
     # GET CATEGORIES
@@ -293,6 +302,11 @@ def home():
         item["total"] = float(
             item["total"]
         )
+    print(
+    f"[PERF] Main database queries: "
+    f"{time.perf_counter() - db_start:.3f}s",
+    flush=True
+    )
 
 
     # =====================================================
@@ -314,7 +328,7 @@ def home():
     # =================================================
     # NEED AT LEAST 2 MONTHS FOR PREDICTION
     # =================================================
-
+    ml_start = time.perf_counter()
     if len(monthly_summary) >= 2:
 
 
@@ -515,12 +529,18 @@ def home():
             "Add expenses across at least 4 "
             "different months to calculate MAE."
         )
+    print(
+    f"[PERF] Linear Regression + MAE: "
+    f"{time.perf_counter() - ml_start:.3f}s",
+    flush=True
+)
 
 
     # =================================================
     # BUDGET ANALYSIS
     # =================================================
-
+    
+    budget_start = time.perf_counter()
     budget_month = month
 
 
@@ -567,6 +587,11 @@ def home():
         item["actual"] = float(
             item["actual"]
         )
+    print(
+    f"[PERF] Budget query: "
+    f"{time.perf_counter() - budget_start:.3f}s",
+    flush=True
+)
 
 
     # =====================================================
@@ -732,7 +757,8 @@ def home():
     # =====================================================
     # STAGE 6 - EXPENSE ANOMALY DETECTION
     # =====================================================
-
+    
+    anomaly_start = time.perf_counter()
     anomalies = []
     anomaly_message = None
     anomaly_count = 0
@@ -803,6 +829,11 @@ def home():
             "Add at least 5 expenses to detect "
             "unusual spending patterns."
         )
+    print(
+    f"[PERF] Isolation Forest: "
+    f"{time.perf_counter() - anomaly_start:.3f}s",
+    flush=True
+)
 
 
     # =================================================
@@ -818,7 +849,7 @@ def home():
     # SEND DATA TO HTML
     # =================================================
 
-    return render_template(
+    response = render_template(
         "index.html",
 
         expenses=expenses,
@@ -859,6 +890,13 @@ def home():
 
         anomaly_message=anomaly_message
     )
+    print(
+    f"[PERF] TOTAL HOME REQUEST: "
+    f"{time.perf_counter() - request_start:.3f}s",
+    flush=True
+    )
+
+    return response
 
 
 # =====================================================
