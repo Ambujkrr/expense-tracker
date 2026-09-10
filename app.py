@@ -29,6 +29,9 @@ def get_db_connection():
 # HOME / DASHBOARD
 # =====================================================
 
+@app.route("/health")
+def health():
+    return "OK"
 
 @app.route("/")
 def home():
