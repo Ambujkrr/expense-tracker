@@ -21,6 +21,7 @@
         method="POST"
         action="/update-expense/{{ expense.id }}"
     >
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
 
         <!-- AMOUNT -->
@@ -45,52 +46,11 @@
 
         <select name="category_id" required>
 
-            <option
-                value="1"
-                {% if expense.category_id == 1 %}selected{% endif %}
-            >
-                Food
+            {% for category in categories %}
+            <option value="{{ category.id }}" {% if expense.category_id == category.id %}selected{% endif %}>
+                {{ category.name }}
             </option>
-
-
-            <option
-                value="2"
-                {% if expense.category_id == 2 %}selected{% endif %}
-            >
-                Transport
-            </option>
-
-
-            <option
-                value="3"
-                {% if expense.category_id == 3 %}selected{% endif %}
-            >
-                Entertainment
-            </option>
-
-
-            <option
-                value="4"
-                {% if expense.category_id == 4 %}selected{% endif %}
-            >
-                Shopping
-            </option>
-
-
-            <option
-                value="5"
-                {% if expense.category_id == 5 %}selected{% endif %}
-            >
-                Education
-            </option>
-
-
-            <option
-                value="6"
-                {% if expense.category_id == 6 %}selected{% endif %}
-            >
-                Other
-            </option>
+            {% endfor %}
 
         </select>
 

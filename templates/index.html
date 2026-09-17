@@ -243,8 +243,20 @@
         <p>Personal expense tracking &amp; forecasting</p>
       </div>
     </div>
-    <div class="stamp"><span class="stamp-dot"></span>RECORDING LIVE</div>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+      <div class="stamp"><span class="stamp-dot"></span>{{ current_user.username }}</div>
+      <form method="POST" action="{{ url_for('logout') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit" class="btn-ghost" style="color:var(--paper);border-color:rgba(216,184,118,0.4);">Log out</button>
+      </form>
+    </div>
   </header>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+      <div class="page" style="margin-bottom:22px;border-top-color:var(--brick);"><div class="page-body">{{ message }}</div></div>
+    {% endfor %}
+  {% endwith %}
 
   <!-- STATS -->
   <div class="stats">
@@ -318,6 +330,7 @@
     </div>
     <div class="page-body">
       <form method="POST" action="/add-expense" class="expense-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <div class="field">
           <label>Amount</label>
           <input type="number" name="amount" step="0.01" min="0" placeholder="&#8377; 500" required>
@@ -569,6 +582,7 @@
                   </button>
                 </a>
                 <form method="POST" action="/delete-expense/{{ expense.id }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                   <button type="submit" class="icon-btn danger" onclick="return confirm('Delete this expense?');">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2m2 0-1 13a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L6 7"/></svg>
                     Delete

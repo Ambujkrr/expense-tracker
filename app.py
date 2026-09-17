@@ -1,13 +1,46 @@
-from flask import Flask, render_template, request, redirect
+from flask import Flask, abort, flash, redirect, render_template, request, url_for
+from flask_login import LoginManager, UserMixin, current_user, login_required, login_user, logout_user
+from flask_wtf.csrf import CSRFProtect
 import mysql.connector
 import os
+import re
+import secrets
 import time
 from datetime import datetime
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error
 from sklearn.ensemble import IsolationForest
+from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
+
+is_production = os.environ.get("FLASK_ENV", "").lower() == "production"
+secret_key = os.environ.get("SECRET_KEY")
+if not secret_key:
+    if is_production:
+        raise RuntimeError("SECRET_KEY must be configured in production.")
+    secret_key = secrets.token_urlsafe(32)
+
+app.config.update(
+    SECRET_KEY=secret_key,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=is_production or os.environ.get("SESSION_COOKIE_SECURE") == "1",
+)
+
+login_manager = LoginManager(app)
+login_manager.login_view = "login"
+login_manager.login_message_category = "info"
+csrf = CSRFProtect(app)
+
+DEFAULT_CATEGORIES = ("Food", "Transport", "Entertainment", "Shopping", "Education", "Other")
+
+
+class User(UserMixin):
+    def __init__(self, user_id, username, email):
+        self.id = user_id
+        self.username = username
+        self.email = email
 
 
 # =====================================================
@@ -21,9 +54,121 @@ def get_db_connection():
         port=int(os.environ.get("MYSQL_PORT", "3306")),
         user=os.environ.get("MYSQL_USER"),
         password=os.environ.get("MYSQL_PASSWORD"),
-        database=os.environ.get("MYSQL_DATABASE"),
+        database=os.environ.get("MYSQL_DATABASE", "defaultdb"),
         ssl_disabled=False
     )
+
+
+def get_user_by_id(user_id):
+    db = get_db_connection()
+    cursor = db.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            "SELECT id, username, email FROM users WHERE id = %s",
+            (user_id,),
+        )
+        row = cursor.fetchone()
+        return User(row["id"], row["username"], row["email"]) if row else None
+    finally:
+        cursor.close()
+        db.close()
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    return get_user_by_id(user_id)
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for("home"))
+
+    if request.method == "POST":
+        identity = request.form.get("identity", "").strip()
+        password = request.form.get("password", "")
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        try:
+            cursor.execute(
+                """
+                SELECT id, username, email, password_hash
+                FROM users
+                WHERE username = %s OR email = %s
+                LIMIT 1
+                """,
+                (identity, identity),
+            )
+            row = cursor.fetchone()
+        finally:
+            cursor.close()
+            db.close()
+
+        if row and check_password_hash(row["password_hash"], password):
+            login_user(User(row["id"], row["username"], row["email"]))
+            return redirect(url_for("home"))
+        flash("Invalid username/email or password.", "error")
+
+    return render_template("login.html")
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for("home"))
+
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        confirmation = request.form.get("password_confirmation", "")
+
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{3,50}", username):
+            flash("Username must be 3–50 characters using letters, numbers, dots, hyphens, or underscores.", "error")
+        elif not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or len(email) > 255:
+            flash("Enter a valid email address.", "error")
+        elif len(password) < 8:
+            flash("Password must be at least 8 characters.", "error")
+        elif password != confirmation:
+            flash("Passwords do not match.", "error")
+        else:
+            db = get_db_connection()
+            cursor = db.cursor(dictionary=True)
+            try:
+                cursor.execute(
+                    "SELECT id FROM users WHERE username = %s OR email = %s LIMIT 1",
+                    (username, email),
+                )
+                if cursor.fetchone():
+                    flash("That username or email is already registered.", "error")
+                else:
+                    cursor.execute(
+                        "INSERT INTO users (username, email, password_hash) VALUES (%s, %s, %s)",
+                        (username, email, generate_password_hash(password)),
+                    )
+                    user_id = cursor.lastrowid
+                    cursor.executemany(
+                        "INSERT INTO categories (user_id, name, monthly_budget) VALUES (%s, %s, %s)",
+                        [(user_id, name, 0) for name in DEFAULT_CATEGORIES],
+                    )
+                    db.commit()
+                    login_user(User(user_id, username, email))
+                    return redirect(url_for("home"))
+            except mysql.connector.Error:
+                db.rollback()
+                flash("Unable to create the account. Please try again.", "error")
+            finally:
+                cursor.close()
+                db.close()
+
+    return render_template("register.html")
+
+
+@app.route("/logout", methods=["POST"])
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for("login"))
 
 # =====================================================
 # HOME / DASHBOARD
@@ -34,6 +179,7 @@ def health():
     return "OK"
 
 @app.route("/")
+@login_required
 def home():
 
     request_start = time.perf_counter()
@@ -71,10 +217,11 @@ def home():
         FROM expenses e
         JOIN categories c
             ON e.category_id = c.id
-        WHERE 1=1
+            AND c.user_id = e.user_id
+        WHERE e.user_id = %s
     """
 
-    params = []
+    params = [current_user.id]
 
     if category_id:
         query += " AND e.category_id = %s"
@@ -151,10 +298,10 @@ def home():
             DATE_FORMAT(e.expense_date, '%Y-%m') AS month,
             SUM(e.amount) AS total
         FROM expenses e
-        WHERE 1=1
+        WHERE e.user_id = %s
     """
 
-    monthly_params = []
+    monthly_params = [current_user.id]
 
     if category_id:
         monthly_query += " AND e.category_id = %s"
@@ -197,7 +344,9 @@ def home():
         FROM categories c
         LEFT JOIN expenses e
             ON c.id = e.category_id
+            AND e.user_id = c.user_id
             AND DATE_FORMAT(e.expense_date, '%Y-%m') = %s
+        WHERE c.user_id = %s
         GROUP BY
             c.id,
             c.name,
@@ -207,7 +356,7 @@ def home():
 
     cursor.execute(
         budget_query,
-        (budget_month,)
+        (budget_month, current_user.id)
     )
 
     budget_summary = cursor.fetchall()
@@ -455,64 +604,6 @@ def home():
     print(
     f"[PERF] Linear Regression + MAE: "
     f"{time.perf_counter() - ml_start:.3f}s",
-    flush=True
-)
-
-
-    # =================================================
-    # BUDGET ANALYSIS
-    # =================================================
-    
-    budget_start = time.perf_counter()
-    budget_month = month
-
-
-    if not budget_month:
-
-        budget_month = datetime.now().strftime(
-            "%Y-%m"
-        )
-
-
-    budget_query = """
-        SELECT
-            c.id,
-            c.name AS category,
-            c.monthly_budget AS budget,
-            COALESCE(SUM(e.amount), 0) AS actual
-        FROM categories c
-        LEFT JOIN expenses e
-            ON c.id = e.category_id
-            AND DATE_FORMAT(e.expense_date, '%Y-%m') = %s
-        GROUP BY
-            c.id,
-            c.name,
-            c.monthly_budget
-        ORDER BY c.id
-    """
-
-
-    cursor.execute(
-        budget_query,
-        (budget_month,)
-    )
-
-
-    budget_summary = cursor.fetchall()
-
-
-    for item in budget_summary:
-
-        item["budget"] = float(
-            item["budget"]
-        )
-
-        item["actual"] = float(
-            item["actual"]
-        )
-    print(
-    f"[PERF] Budget query: "
-    f"{time.perf_counter() - budget_start:.3f}s",
     flush=True
 )
 
@@ -830,16 +921,20 @@ def home():
     "/add-expense",
     methods=["POST"]
 )
+@login_required
 def add_expense():
 
-    amount = request.form["amount"]
+    amount = request.form.get("amount", "").strip()
 
-    category_id = request.form["category_id"]
+    category_id = request.form.get("category_id", type=int)
 
-    expense_date = request.form["expense_date"]
+    expense_date = request.form.get("expense_date", "").strip()
 
-    note = request.form["note"]
+    note = request.form.get("note", "").strip()
 
+
+    if category_id is None:
+        abort(404)
 
     db = get_db_connection()
 
@@ -849,6 +944,7 @@ def add_expense():
     query = """
         INSERT INTO expenses
         (
+            user_id,
             category_id,
             amount,
             note,
@@ -859,20 +955,22 @@ def add_expense():
             %s,
             %s,
             %s,
+            %s,
             %s
         )
     """
 
 
     cursor.execute(
-        query,
-        (
-            category_id,
-            amount,
-            note,
-            expense_date
-        )
+        "SELECT id FROM categories WHERE id = %s AND user_id = %s",
+        (category_id, current_user.id),
     )
+    if cursor.fetchone() is None:
+        cursor.close()
+        db.close()
+        abort(404)
+
+    cursor.execute(query, (current_user.id, category_id, amount, note, expense_date))
 
 
     db.commit()
@@ -883,7 +981,7 @@ def add_expense():
     db.close()
 
 
-    return redirect("/")
+    return redirect(url_for("home"))
 
 
 # =====================================================
@@ -894,6 +992,7 @@ def add_expense():
     "/delete-expense/<int:expense_id>",
     methods=["POST"]
 )
+@login_required
 def delete_expense(expense_id):
 
     db = get_db_connection()
@@ -903,15 +1002,20 @@ def delete_expense(expense_id):
 
     query = """
         DELETE FROM expenses
-        WHERE id = %s
+        WHERE id = %s AND user_id = %s
     """
 
 
     cursor.execute(
         query,
-        (expense_id,)
+        (expense_id, current_user.id)
     )
 
+    if cursor.rowcount != 1:
+        db.rollback()
+        cursor.close()
+        db.close()
+        abort(404)
 
     db.commit()
 
@@ -921,7 +1025,7 @@ def delete_expense(expense_id):
     db.close()
 
 
-    return redirect("/")
+    return redirect(url_for("home"))
 
 
 # =====================================================
@@ -931,6 +1035,7 @@ def delete_expense(expense_id):
 @app.route(
     "/edit-expense/<int:expense_id>"
 )
+@login_required
 def edit_expense(expense_id):
 
     db = get_db_connection()
@@ -948,32 +1053,37 @@ def edit_expense(expense_id):
             note,
             expense_date
         FROM expenses
-        WHERE id = %s
+        WHERE id = %s AND user_id = %s
     """
 
 
     cursor.execute(
         query,
-        (expense_id,)
+        (expense_id, current_user.id)
     )
 
 
     expense = cursor.fetchone()
 
 
-    cursor.close()
-
-    db.close()
-
-
     if expense is None:
+        cursor.close()
+        db.close()
+        abort(404)
 
-        return "Expense not found", 404
+    cursor.execute(
+        "SELECT id, name FROM categories WHERE user_id = %s ORDER BY name",
+        (current_user.id,),
+    )
+    categories = cursor.fetchall()
 
+    cursor.close()
+    db.close()
 
     return render_template(
         "edit_expense.html",
-        expense=expense
+        expense=expense,
+        categories=categories
     )
 
 
@@ -985,16 +1095,20 @@ def edit_expense(expense_id):
     "/update-expense/<int:expense_id>",
     methods=["POST"]
 )
+@login_required
 def update_expense(expense_id):
 
-    amount = request.form["amount"]
+    amount = request.form.get("amount", "").strip()
 
-    category_id = request.form["category_id"]
+    category_id = request.form.get("category_id", type=int)
 
-    expense_date = request.form["expense_date"]
+    expense_date = request.form.get("expense_date", "").strip()
 
-    note = request.form["note"]
+    note = request.form.get("note", "").strip()
 
+
+    if category_id is None:
+        abort(404)
 
     db = get_db_connection()
 
@@ -1010,21 +1124,29 @@ def update_expense(expense_id):
             expense_date = %s,
             note = %s
 
-        WHERE id = %s
+        WHERE id = %s AND user_id = %s
     """
 
 
     cursor.execute(
+        "SELECT id FROM categories WHERE id = %s AND user_id = %s",
+        (category_id, current_user.id),
+    )
+    if cursor.fetchone() is None:
+        cursor.close()
+        db.close()
+        abort(404)
+
+    cursor.execute(
         query,
-        (
-            amount,
-            category_id,
-            expense_date,
-            note,
-            expense_id
-        )
+        (amount, category_id, expense_date, note, expense_id, current_user.id)
     )
 
+    if cursor.rowcount != 1:
+        db.rollback()
+        cursor.close()
+        db.close()
+        abort(404)
 
     db.commit()
 
@@ -1034,7 +1156,7 @@ def update_expense(expense_id):
     db.close()
 
 
-    return redirect("/")
+    return redirect(url_for("home"))
 
 
 # =====================================================
@@ -1044,5 +1166,5 @@ def update_expense(expense_id):
 if __name__ == "__main__":
 
     app.run(
-        debug=True
+        debug=os.environ.get("FLASK_DEBUG") == "1"
     )

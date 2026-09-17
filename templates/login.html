@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign in — Ledger</title>
+  <style>
+    body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0F1712;color:#1E2A22;font-family:system-ui,sans-serif}
+    main{width:min(420px,calc(100% - 40px));background:#F4EFE0;padding:34px;border-radius:8px;box-shadow:0 18px 40px rgba(0,0,0,.35)}
+    h1{margin:0 0 8px}p{color:#4A5A4E}.field{display:grid;gap:6px;margin:16px 0}input{padding:11px;border:1px solid #D9D0B7;border-radius:4px;font:inherit}button{width:100%;padding:11px;border:0;border-radius:4px;background:#1E2A22;color:#F4EFE0;font-weight:700;cursor:pointer}.message{padding:10px;background:#F5DDD7;color:#742E22;border-radius:4px;margin:12px 0}a{color:#3E6B4E}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Welcome back</h1>
+    <p>Sign in to your personal expense ledger.</p>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}<div class="message">{{ message }}</div>{% endfor %}
+    {% endwith %}
+    <form method="POST" action="{{ url_for('login') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div class="field"><label for="identity">Username or email</label><input id="identity" name="identity" autocomplete="username" required autofocus></div>
+      <div class="field"><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required></div>
+      <button type="submit">Sign in</button>
+    </form>
+    <p>New here? <a href="{{ url_for('register') }}">Create an account</a>.</p>
+  </main>
+</body>
+</html>
