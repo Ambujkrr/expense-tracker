@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import time
+import threading
 from datetime import datetime
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error
@@ -62,16 +63,47 @@ class User(UserMixin):
 # DATABASE CONNECTION
 # =====================================================
 
-def get_db_connection():
+# Shared MySQL connection pool.
+# A fresh TLS-encrypted connection was previously opened for every
+# request, and again by the login user loader, which dominated response
+# time against a remote database. The pool is created once and reused;
+# connections return to it when the existing finally blocks call
+# db.close(), which for a pooled connection is a return-to-pool.
+_db_pool = None
+_db_pool_lock = threading.Lock()
 
-    return mysql.connector.connect(
-        host=os.environ.get("MYSQL_HOST"),
-        port=int(os.environ.get("MYSQL_PORT", "3306")),
-        user=os.environ.get("MYSQL_USER"),
-        password=os.environ.get("MYSQL_PASSWORD"),
-        database=os.environ.get("MYSQL_DATABASE", "defaultdb"),
-        ssl_disabled=False
-    )
+
+def _get_db_pool():
+    """Return the shared pool, creating it once on first real use.
+
+    Creation is deferred to the first request so that merely importing
+    app.py (as the test suite does) never opens a database connection.
+    """
+    global _db_pool
+    if _db_pool is None:
+        with _db_pool_lock:
+            if _db_pool is None:
+                _db_pool = mysql.connector.pooling.MySQLConnectionPool(
+                    pool_name="expense_tracker_pool",
+                    pool_size=5,
+                    host=os.environ.get("MYSQL_HOST"),
+                    port=int(os.environ.get("MYSQL_PORT", "3306")),
+                    user=os.environ.get("MYSQL_USER"),
+                    password=os.environ.get("MYSQL_PASSWORD"),
+                    database=os.environ.get("MYSQL_DATABASE", "defaultdb"),
+                    ssl_disabled=False,
+                )
+    return _db_pool
+
+
+def get_db_connection():
+    """Borrow a connection from the shared pool.
+
+    Callers return it with the close() call already present in every
+    finally block; for a pooled connection that puts it back in the
+    pool instead of destroying it.
+    """
+    return _get_db_pool().get_connection()
 
 
 def get_user_by_id(user_id):
