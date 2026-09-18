@@ -106,6 +106,25 @@ def get_db_connection():
     return _get_db_pool().get_connection()
 
 
+def _month_range(month):
+    """Return (month_start, next_month_start) datetimes for a YYYY-MM string.
+
+    Falls back to the current calendar month when month is empty or invalid,
+    matching the previous default behaviour. Used in place of
+    DATE_FORMAT(expense_date) predicates so an index-friendly range is used.
+    """
+    try:
+        start = datetime.strptime(month, "%Y-%m")
+    except (TypeError, ValueError):
+        start = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    if start.month == 12:
+        nxt = start.replace(year=start.year + 1, month=1)
+    else:
+        nxt = start.replace(month=start.month + 1)
+    return start, nxt
+
+
 def get_user_by_id(user_id):
     db = get_db_connection()
     cursor = db.cursor(dictionary=True)
@@ -290,13 +309,18 @@ def home():
 
         params = [current_user.id]
 
+        # Inclusive-start / exclusive-end bounds for the selected month.
+        # Replacing the DATE_FORMAT(expense_date) call with a range keeps
+        # the idx_expenses_user_date index usable.
+        month_start, next_month_start = _month_range(month)
+
         if category_id:
             query += " AND e.category_id = %s"
             params.append(category_id)
 
         if month:
-            query += " AND DATE_FORMAT(e.expense_date, '%Y-%m') = %s"
-            params.append(month)
+            query += " AND e.expense_date >= %s AND e.expense_date < %s"
+            params.extend([month_start, next_month_start])
 
         query += " ORDER BY e.expense_date DESC"
 
@@ -412,7 +436,8 @@ def home():
             LEFT JOIN expenses e
                 ON c.id = e.category_id
                 AND e.user_id = c.user_id
-                AND DATE_FORMAT(e.expense_date, '%Y-%m') = %s
+                AND e.expense_date >= %s
+                AND e.expense_date < %s
             WHERE c.user_id = %s
             GROUP BY
                 c.id,
@@ -421,9 +446,11 @@ def home():
             ORDER BY c.id
         """
 
+        budget_month_start, budget_next_month_start = _month_range(budget_month)
+
         cursor.execute(
             budget_query,
-            (budget_month, current_user.id)
+            (budget_month_start, budget_next_month_start, current_user.id)
         )
 
         budget_summary = cursor.fetchall()
