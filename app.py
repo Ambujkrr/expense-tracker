@@ -1,6 +1,7 @@
-from flask import Flask, abort, flash, redirect, render_template, request, url_for
+from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
 from flask_login import LoginManager, UserMixin, current_user, login_required, login_user, logout_user
 from flask_wtf.csrf import CSRFProtect
+import math
 import mysql.connector
 import os
 import re
@@ -34,6 +35,20 @@ login_manager.login_message_category = "info"
 csrf = CSRFProtect(app)
 
 DEFAULT_CATEGORIES = ("Food", "Transport", "Entertainment", "Shopping", "Education", "Other")
+
+# =====================================================
+# ML RESULTS CACHE
+# =====================================================
+# In-memory cache for expensive ML calculations
+# Key: user_id (int)
+# Value: dict with ML results (prediction, mae, anomalies)
+# Invalidated on expense mutations (add/update/delete)
+_ml_cache = {}
+
+def _invalidate_ml_cache(user_id):
+    """Invalidate ML cache for specific user"""
+    _ml_cache.pop(user_id, None)
+    print(f"[CACHE] Invalidated ML cache for user_id={user_id}", flush=True)
 
 
 class User(UserMixin):
@@ -87,9 +102,12 @@ def login():
     if request.method == "POST":
         identity = request.form.get("identity", "").strip()
         password = request.form.get("password", "")
-        db = get_db_connection()
-        cursor = db.cursor(dictionary=True)
+        db = None
+        cursor = None
+        row = None
         try:
+            db = get_db_connection()
+            cursor = db.cursor(dictionary=True)
             cursor.execute(
                 """
                 SELECT id, username, email, password_hash
@@ -100,9 +118,16 @@ def login():
                 (identity, identity),
             )
             row = cursor.fetchone()
+        except mysql.connector.Error:
+            if db is not None:
+                db.rollback()
+            flash("Unable to sign in. Please try again.", "error")
+            return render_template("login.html")
         finally:
-            cursor.close()
-            db.close()
+            if cursor is not None:
+                cursor.close()
+            if db is not None:
+                db.close()
 
         if row and check_password_hash(row["password_hash"], password):
             login_user(User(row["id"], row["username"], row["email"]))
@@ -186,6 +211,11 @@ def home():
     category_id = request.args.get("category_id")
     month = request.args.get("month")
 
+    # Check if we should skip ML calculation (after expense mutation)
+    skip_ml = session.pop('skip_ml_calculation', False)
+    if skip_ml:
+        print(f"[CACHE] Skipping ML calculation for user_id={current_user.id} (post-mutation)", flush=True)
+
 
     # =================================================
     # CONNECT TO DATABASE
@@ -193,192 +223,233 @@ def home():
 
     db_start = time.perf_counter()
 
-    db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    db = None
 
-    print(
-        f"[PERF] Database connection: "
-        f"{time.perf_counter() - db_start:.3f}s",
-        flush=True
-    )
+    cursor = None
 
-    # =================================================
-    # GET EXPENSES
-    # =================================================
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
 
-    query = """
-        SELECT
-            e.id,
-            e.amount,
-            e.note,
-            e.expense_date,
-            e.category_id,
-            c.name AS category
-        FROM expenses e
-        JOIN categories c
-            ON e.category_id = c.id
-            AND c.user_id = e.user_id
-        WHERE e.user_id = %s
-    """
-
-    params = [current_user.id]
-
-    if category_id:
-        query += " AND e.category_id = %s"
-        params.append(category_id)
-
-    if month:
-        query += " AND DATE_FORMAT(e.expense_date, '%Y-%m') = %s"
-        params.append(month)
-
-    query += " ORDER BY e.expense_date DESC"
-
-    cursor.execute(
-        query,
-        params
-    )
-
-    expenses = cursor.fetchall()
-
-
-    # =================================================
-    # CALCULATE TOTAL AND COUNT IN PYTHON
-    # =================================================
-
-    total_spending = sum(
-        float(expense["amount"])
-        for expense in expenses
-    )
-
-    expense_count = len(expenses)
-
-
-    # =================================================
-    # CATEGORY-WISE SPENDING
-    # =================================================
-
-    category_totals = {}
-
-    for expense in expenses:
-
-        category_name = expense["category"]
-
-        category_totals[category_name] = (
-            category_totals.get(category_name, 0)
-            + float(expense["amount"])
+        print(
+            f"[PERF] Database connection: "
+            f"{time.perf_counter() - db_start:.3f}s",
+            flush=True
         )
 
-    category_summary = [
-        {
-            "category": category_name,
-            "total": round(total, 2)
-        }
-        for category_name, total in category_totals.items()
-    ]
+        # =================================================
+        # GET EXPENSES
+        # =================================================
 
-    category_summary.sort(
-        key=lambda item: item["total"],
-        reverse=True
-    )
+        query = """
+            SELECT
+                e.id,
+                e.amount,
+                e.note,
+                e.expense_date,
+                e.category_id,
+                c.name AS category
+            FROM expenses e
+            JOIN categories c
+                ON e.category_id = c.id
+                AND c.user_id = e.user_id
+            WHERE e.user_id = %s
+        """
 
+        params = [current_user.id]
 
-    # =================================================
-    # MONTHLY SPENDING
-    # =================================================
+        if category_id:
+            query += " AND e.category_id = %s"
+            params.append(category_id)
 
-    # We intentionally do NOT apply the selected
-    # month filter here.
-    #
-    # The ML model needs historical monthly data.
-    #
-    # Category filter is still respected.
+        if month:
+            query += " AND DATE_FORMAT(e.expense_date, '%Y-%m') = %s"
+            params.append(month)
 
-    monthly_query = """
-        SELECT
-            DATE_FORMAT(e.expense_date, '%Y-%m') AS month,
-            SUM(e.amount) AS total
-        FROM expenses e
-        WHERE e.user_id = %s
-    """
+        query += " ORDER BY e.expense_date DESC"
 
-    monthly_params = [current_user.id]
+        cursor.execute(
+            query,
+            params
+        )
 
-    if category_id:
-        monthly_query += " AND e.category_id = %s"
-        monthly_params.append(category_id)
-
-    monthly_query += """
-        GROUP BY
-            DATE_FORMAT(e.expense_date, '%Y-%m')
-        ORDER BY month
-    """
-
-    cursor.execute(
-        monthly_query,
-        monthly_params
-    )
-
-    monthly_summary = cursor.fetchall()
-
-    for item in monthly_summary:
-        item["total"] = float(item["total"])
+        expenses = cursor.fetchall()
 
 
-    # =================================================
-    # CATEGORIES + BUDGET ANALYSIS
-    # =================================================
+        # =================================================
+        # CALCULATE TOTAL AND COUNT IN PYTHON
+        # =================================================
 
-    budget_start = time.perf_counter()
+        total_spending = sum(
+            float(expense["amount"])
+            for expense in expenses
+        )
 
-    budget_month = month
+        expense_count = len(expenses)
 
-    if not budget_month:
-        budget_month = datetime.now().strftime("%Y-%m")
 
-    budget_query = """
-        SELECT
-            c.id,
-            c.name AS category,
-            c.monthly_budget AS budget,
-            COALESCE(SUM(e.amount), 0) AS actual
-        FROM categories c
-        LEFT JOIN expenses e
-            ON c.id = e.category_id
-            AND e.user_id = c.user_id
-            AND DATE_FORMAT(e.expense_date, '%Y-%m') = %s
-        WHERE c.user_id = %s
-        GROUP BY
-            c.id,
-            c.name,
-            c.monthly_budget
-        ORDER BY c.id
-    """
+        # =================================================
+        # CATEGORY-WISE SPENDING
+        # =================================================
 
-    cursor.execute(
-        budget_query,
-        (budget_month, current_user.id)
-    )
+        category_totals = {}
 
-    budget_summary = cursor.fetchall()
+        for expense in expenses:
 
-    categories = []
+            category_name = expense["category"]
 
-    for item in budget_summary:
+            category_totals[category_name] = (
+                category_totals.get(category_name, 0)
+                + float(expense["amount"])
+            )
 
-        item["budget"] = float(item["budget"])
-        item["actual"] = float(item["actual"])
+        category_summary = [
+            {
+                "category": category_name,
+                "total": round(total, 2)
+            }
+            for category_name, total in category_totals.items()
+        ]
 
-        categories.append({
-            "id": item["id"],
-            "name": item["category"],
-            "monthly_budget": item["budget"]
-        })
-    categories.sort(key=lambda item: item["name"].lower())
-    print(
-        f"[PERF] Main database queries: "
-        f"{time.perf_counter() - db_start:.3f}s",
-        flush=True
-    )
+        category_summary.sort(
+            key=lambda item: item["total"],
+            reverse=True
+        )
+
+
+        # =================================================
+        # MONTHLY SPENDING
+        # =================================================
+
+        # We intentionally do NOT apply the selected
+        # month filter here.
+        #
+        # The ML model needs historical monthly data.
+        #
+        # Category filter is still respected.
+
+        monthly_query = """
+            SELECT
+                DATE_FORMAT(e.expense_date, '%Y-%m') AS month,
+                SUM(e.amount) AS total
+            FROM expenses e
+            WHERE e.user_id = %s
+        """
+
+        monthly_params = [current_user.id]
+
+        if category_id:
+            monthly_query += " AND e.category_id = %s"
+            monthly_params.append(category_id)
+
+        monthly_query += """
+            GROUP BY
+                DATE_FORMAT(e.expense_date, '%Y-%m')
+            ORDER BY month
+        """
+
+        cursor.execute(
+            monthly_query,
+            monthly_params
+        )
+
+        monthly_summary = cursor.fetchall()
+
+        for item in monthly_summary:
+            item["total"] = float(item["total"])
+
+
+        # =================================================
+        # CATEGORIES + BUDGET ANALYSIS
+        # =================================================
+
+        budget_start = time.perf_counter()
+
+        budget_month = month
+
+        if not budget_month:
+            budget_month = datetime.now().strftime("%Y-%m")
+
+        budget_query = """
+            SELECT
+                c.id,
+                c.name AS category,
+                c.monthly_budget AS budget,
+                COALESCE(SUM(e.amount), 0) AS actual
+            FROM categories c
+            LEFT JOIN expenses e
+                ON c.id = e.category_id
+                AND e.user_id = c.user_id
+                AND DATE_FORMAT(e.expense_date, '%Y-%m') = %s
+            WHERE c.user_id = %s
+            GROUP BY
+                c.id,
+                c.name,
+                c.monthly_budget
+            ORDER BY c.id
+        """
+
+        cursor.execute(
+            budget_query,
+            (budget_month, current_user.id)
+        )
+
+        budget_summary = cursor.fetchall()
+
+        categories = []
+
+        for item in budget_summary:
+
+            item["budget"] = float(item["budget"])
+            item["actual"] = float(item["actual"])
+
+            categories.append({
+                "id": item["id"],
+                "name": item["category"],
+                "monthly_budget": item["budget"]
+            })
+        categories.sort(key=lambda item: item["name"].lower())
+        print(
+            f"[PERF] Main database queries: "
+            f"{time.perf_counter() - db_start:.3f}s",
+            flush=True
+        )
+    except mysql.connector.Error:
+        if db is not None:
+            db.rollback()
+        flash("Unable to load your data. Please try again.", "error")
+        # Render the dashboard shell here rather than redirecting to "home":
+        # a persistent database outage would otherwise redirect back into
+        # this same route and loop. The finally block below still releases
+        # any connection that was opened.
+        return render_template(
+            "index.html",
+            expenses=[],
+            categories=[],
+            category_summary=[],
+            monthly_summary=[],
+            budget_summary=[],
+            total_spending=0,
+            expense_count=0,
+            selected_category=category_id,
+            selected_month=month,
+            budget_month=month or datetime.now().strftime("%Y-%m"),
+            prediction=None,
+            prediction_month=None,
+            prediction_message=None,
+            mae=None,
+            mae_message=None,
+            insights=[],
+            anomalies=[],
+            anomaly_count=0,
+            anomaly_message=None,
+        )
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if db is not None:
+            db.close()
+
 
 
     # =====================================================
@@ -398,214 +469,251 @@ def home():
 
 
     # =================================================
-    # NEED AT LEAST 2 MONTHS FOR PREDICTION
+    # ML CALCULATION WITH CACHING
     # =================================================
     ml_start = time.perf_counter()
-    if len(monthly_summary) >= 2:
 
-
-        # ---------------------------------------------
-        # PREPARE DATA
-        # ---------------------------------------------
-
-        X = []
-
-        y = []
-
-
-        for index, item in enumerate(monthly_summary):
-
-            X.append(
-                [index + 1]
-            )
-
-            y.append(
-                item["total"]
-            )
-
-
-        # ---------------------------------------------
-        # TRAIN FINAL MODEL
-        # ---------------------------------------------
-
-        model = LinearRegression()
-
-
-        model.fit(
-            X,
-            y
-        )
-
-
-        # ---------------------------------------------
-        # PREDICT NEXT MONTH
-        # ---------------------------------------------
-
-        next_month_number = (
-            len(monthly_summary) + 1
-        )
-
-
-        predicted_value = model.predict(
-            [[next_month_number]]
-        )[0]
-
-
-        # Prevent negative prediction
-
-        predicted_value = max(
-            0,
-            predicted_value
-        )
-
-
-        prediction = round(
-            float(predicted_value),
-            2
-        )
-
-
-        # ---------------------------------------------
-        # FIND NEXT MONTH
-        # ---------------------------------------------
-
-        last_month = datetime.strptime(
-            monthly_summary[-1]["month"],
-            "%Y-%m"
-        )
-
-
-        if last_month.month == 12:
-
-            next_year = (
-                last_month.year + 1
-            )
-
-            next_month = 1
-
-        else:
-
-            next_year = last_month.year
-
-            next_month = (
-                last_month.month + 1
-            )
-
-
-        prediction_month = (
-            f"{next_year:04d}-{next_month:02d}"
-        )
-
-
-        # =================================================
-        # MODEL EVALUATION USING MAE
-        # =================================================
-        #
-        # We keep the latest month as test data.
-        #
-        # Example:
-        #
-        # May     -> training
-        # June    -> training
-        # July    -> training
-        # August  -> test
-        #
-        # Then we predict August and compare it with
-        # the actual August spending.
-        # =================================================
-
-        if len(monthly_summary) >= 4:
-
-
-            # -----------------------------------------
-            # TRAINING DATA
-            # -----------------------------------------
-
-            train_X = X[:-1]
-
-            train_y = y[:-1]
-
-
-            # -----------------------------------------
-            # TEST DATA
-            # -----------------------------------------
-
-            test_X = X[-1:]
-
-            test_y = y[-1:]
-
-
-            # -----------------------------------------
-            # CREATE EVALUATION MODEL
-            # -----------------------------------------
-
-            evaluation_model = LinearRegression()
-
-
-            evaluation_model.fit(
-                train_X,
-                train_y
-            )
-
-
-            # -----------------------------------------
-            # PREDICT TEST MONTH
-            # -----------------------------------------
-
-            test_prediction = (
-                evaluation_model.predict(
-                    test_X
-                )
-            )
-
-
-            # -----------------------------------------
-            # CALCULATE MAE
-            # -----------------------------------------
-
-            mae_value = mean_absolute_error(
-                test_y,
-                test_prediction
-            )
-
-
-            mae = round(
-                float(mae_value),
-                2
-            )
-
-
-            mae_message = (
-                "Latest month was used as test data "
-                "for MAE evaluation."
-            )
-
-
-        else:
-
-            mae_message = (
-                "Add expenses across at least 4 "
-                "different months to calculate MAE."
-            )
-
-
+    if skip_ml:
+        # Skip ML calculation after expense mutation for immediate response
+        prediction = None
+        prediction_month = None
+        prediction_message = "Recalculating prediction..."
+        mae = None
+        mae_message = "Recalculating model evaluation..."
+        print(f"[PERF] Skipped ML calculation: {time.perf_counter() - ml_start:.3f}s", flush=True)
     else:
+        # Check if ML results are cached
+        cached_ml = _ml_cache.get(current_user.id)
 
-        prediction_message = (
-            "Add expenses across at least 2 "
-            "different months to generate a prediction."
-        )
+        if cached_ml:
+            # Use cached results
+            prediction = cached_ml.get("prediction")
+            prediction_month = cached_ml.get("prediction_month")
+            prediction_message = cached_ml.get("prediction_message")
+            mae = cached_ml.get("mae")
+            mae_message = cached_ml.get("mae_message")
+            print(f"[CACHE] Using cached ML prediction for user_id={current_user.id}", flush=True)
+            print(f"[PERF] Linear Regression + MAE (cached): {time.perf_counter() - ml_start:.3f}s", flush=True)
+        else:
+            # Compute ML results
+            # =================================================
+            # NEED AT LEAST 2 MONTHS FOR PREDICTION
+            # =================================================
+            if len(monthly_summary) >= 2:
 
 
-        mae_message = (
-            "Add expenses across at least 4 "
-            "different months to calculate MAE."
-        )
-    print(
-    f"[PERF] Linear Regression + MAE: "
-    f"{time.perf_counter() - ml_start:.3f}s",
-    flush=True
-)
+                # ---------------------------------------------
+                # PREPARE DATA
+                # ---------------------------------------------
+
+                X = []
+
+                y = []
+
+
+                for index, item in enumerate(monthly_summary):
+
+                    X.append(
+                        [index + 1]
+                    )
+
+                    y.append(
+                        item["total"]
+                    )
+
+
+                # ---------------------------------------------
+                # TRAIN FINAL MODEL
+                # ---------------------------------------------
+
+                model = LinearRegression()
+
+
+                model.fit(
+                    X,
+                    y
+                )
+
+
+                # ---------------------------------------------
+                # PREDICT NEXT MONTH
+                # ---------------------------------------------
+
+                next_month_number = (
+                    len(monthly_summary) + 1
+                )
+
+
+                predicted_value = model.predict(
+                    [[next_month_number]]
+                )[0]
+
+
+                # Prevent negative prediction
+
+                predicted_value = max(
+                    0,
+                    predicted_value
+                )
+
+
+                prediction = round(
+                    float(predicted_value),
+                    2
+                )
+
+
+                # ---------------------------------------------
+                # FIND NEXT MONTH
+                # ---------------------------------------------
+
+                last_month = datetime.strptime(
+                    monthly_summary[-1]["month"],
+                    "%Y-%m"
+                )
+
+
+                if last_month.month == 12:
+
+                    next_year = (
+                        last_month.year + 1
+                    )
+
+                    next_month = 1
+
+                else:
+
+                    next_year = last_month.year
+
+                    next_month = (
+                        last_month.month + 1
+                    )
+
+
+                prediction_month = (
+                    f"{next_year:04d}-{next_month:02d}"
+                )
+
+
+                # =================================================
+                # MODEL EVALUATION USING MAE
+                # =================================================
+                #
+                # We keep the latest month as test data.
+                #
+                # Example:
+                #
+                # May     -> training
+                # June    -> training
+                # July    -> training
+                # August  -> test
+                #
+                # Then we predict August and compare it with
+                # the actual August spending.
+                # =================================================
+
+                if len(monthly_summary) >= 4:
+
+
+                    # -----------------------------------------
+                    # TRAINING DATA
+                    # -----------------------------------------
+
+                    train_X = X[:-1]
+
+                    train_y = y[:-1]
+
+
+                    # -----------------------------------------
+                    # TEST DATA
+                    # -----------------------------------------
+
+                    test_X = X[-1:]
+
+                    test_y = y[-1:]
+
+
+                    # -----------------------------------------
+                    # CREATE EVALUATION MODEL
+                    # -----------------------------------------
+
+                    evaluation_model = LinearRegression()
+
+
+                    evaluation_model.fit(
+                        train_X,
+                        train_y
+                    )
+
+
+                    # -----------------------------------------
+                    # PREDICT TEST MONTH
+                    # -----------------------------------------
+
+                    test_prediction = (
+                        evaluation_model.predict(
+                            test_X
+                        )
+                    )
+
+
+                    # -----------------------------------------
+                    # CALCULATE MAE
+                    # -----------------------------------------
+
+                    mae_value = mean_absolute_error(
+                        test_y,
+                        test_prediction
+                    )
+
+
+                    mae = round(
+                        float(mae_value),
+                        2
+                    )
+
+
+                    mae_message = (
+                        "Latest month was used as test data "
+                        "for MAE evaluation."
+                    )
+
+
+                else:
+
+                    mae_message = (
+                        "Add expenses across at least 4 "
+                        "different months to calculate MAE."
+                    )
+
+
+            else:
+
+                prediction_message = (
+                    "Add expenses across at least 2 "
+                    "different months to generate a prediction."
+                )
+
+
+                mae_message = (
+                    "Add expenses across at least 4 "
+                    "different months to calculate MAE."
+                )
+
+            # Cache the computed ML results
+            _ml_cache[current_user.id] = {
+                "prediction": prediction,
+                "prediction_month": prediction_month,
+                "prediction_message": prediction_message,
+                "mae": mae,
+                "mae_message": mae_message
+            }
+            print(f"[CACHE] Stored ML prediction for user_id={current_user.id}", flush=True)
+            print(
+                f"[PERF] Linear Regression + MAE: "
+                f"{time.perf_counter() - ml_start:.3f}s",
+                flush=True
+            )
 
 
     # =====================================================
@@ -771,92 +879,112 @@ def home():
     # =====================================================
     # STAGE 6 - EXPENSE ANOMALY DETECTION
     # =====================================================
-    
+
     anomaly_start = time.perf_counter()
     anomalies = []
     anomaly_message = None
     anomaly_count = 0
 
-    # Isolation Forest needs multiple expense records
-    # to identify unusual spending patterns.
-    if len(expenses) >= 5:
-
-        # Use expense amount as the ML feature.
-        anomaly_data = [
-            [float(expense["amount"])]
-            for expense in expenses
-        ]
-
-        anomaly_model = IsolationForest(
-            contamination=0.10,
-            random_state=42
-        )
-
-        anomaly_predictions = anomaly_model.fit_predict(
-            anomaly_data
-        )
-
-        anomaly_scores = anomaly_model.decision_function(
-            anomaly_data
-        )
-
-        for index, prediction_result in enumerate(
-            anomaly_predictions
-        ):
-
-            if prediction_result == -1:
-
-                anomaly = dict(expenses[index])
-
-                anomaly["amount"] = float(
-                    anomaly["amount"]
-                )
-
-                anomaly["anomaly_score"] = round(
-                    float(anomaly_scores[index]),
-                    4
-                )
-
-                anomalies.append(anomaly)
-
-        # Show the most unusual/high-value expenses first.
-        anomalies.sort(
-            key=lambda item: item["amount"],
-            reverse=True
-        )
-
-        anomaly_count = len(anomalies)
-
-        if anomaly_count > 0:
-            anomaly_message = (
-                f"{anomaly_count} potentially unusual "
-                f"expense(s) detected."
-            )
-        else:
-            anomaly_message = (
-                "No unusual expenses detected."
-            )
-
+    if skip_ml:
+        # Skip anomaly detection after expense mutation for immediate response
+        anomalies = []
+        anomaly_count = 0
+        anomaly_message = "Recalculating anomaly detection..."
+        print(f"[PERF] Skipped Isolation Forest: {time.perf_counter() - anomaly_start:.3f}s", flush=True)
     else:
+        # Check if anomaly results are cached
+        cached_ml = _ml_cache.get(current_user.id)
 
-        anomaly_message = (
-            "Add at least 5 expenses to detect "
-            "unusual spending patterns."
-        )
-    print(
-    f"[PERF] Isolation Forest: "
-    f"{time.perf_counter() - anomaly_start:.3f}s",
-    flush=True
-)
+        if cached_ml and "anomalies" in cached_ml:
+            # Use cached anomaly results
+            anomalies = cached_ml.get("anomalies", [])
+            anomaly_count = cached_ml.get("anomaly_count", 0)
+            anomaly_message = cached_ml.get("anomaly_message")
+            print(f"[CACHE] Using cached anomaly detection for user_id={current_user.id}", flush=True)
+            print(f"[PERF] Isolation Forest (cached): {time.perf_counter() - anomaly_start:.3f}s", flush=True)
+        else:
+            # Compute anomaly detection
+            # Isolation Forest needs multiple expense records
+            # to identify unusual spending patterns.
+            if len(expenses) >= 5:
 
+                # Use expense amount as the ML feature.
+                anomaly_data = [
+                    [float(expense["amount"])]
+                    for expense in expenses
+                ]
 
-    # =================================================
-    # CLOSE DATABASE
-    # =================================================
+                anomaly_model = IsolationForest(
+                    contamination=0.10,
+                    random_state=42
+                )
 
-    cursor.close()
+                anomaly_predictions = anomaly_model.fit_predict(
+                    anomaly_data
+                )
 
-    db.close()
+                anomaly_scores = anomaly_model.decision_function(
+                    anomaly_data
+                )
+
+                for index, prediction_result in enumerate(
+                    anomaly_predictions
+                ):
+
+                    if prediction_result == -1:
+
+                        anomaly = dict(expenses[index])
+
+                        anomaly["amount"] = float(
+                            anomaly["amount"]
+                        )
+
+                        anomaly["anomaly_score"] = round(
+                            float(anomaly_scores[index]),
+                            4
+                        )
+
+                        anomalies.append(anomaly)
+
+                # Show the most unusual/high-value expenses first.
+                anomalies.sort(
+                    key=lambda item: item["amount"],
+                    reverse=True
+                )
+
+                anomaly_count = len(anomalies)
+
+                if anomaly_count > 0:
+                    anomaly_message = (
+                        f"{anomaly_count} potentially unusual "
+                        f"expense(s) detected."
+                    )
+                else:
+                    anomaly_message = (
+                        "No unusual expenses detected."
+                    )
+
+            else:
+
+                anomaly_message = (
+                    "Add at least 5 expenses to detect "
+                    "unusual spending patterns."
+                )
+
+            # Update cache with anomaly results
+            cache_entry = _ml_cache.get(current_user.id, {})
+            cache_entry.update({
+                "anomalies": anomalies,
+                "anomaly_count": anomaly_count,
+                "anomaly_message": anomaly_message
+            })
+            _ml_cache[current_user.id] = cache_entry
+            print(f"[CACHE] Stored anomaly detection for user_id={current_user.id}", flush=True)
+            print(
+                f"[PERF] Isolation Forest: "
+                f"{time.perf_counter() - anomaly_start:.3f}s",
+                flush=True
+            )
 
 
     # =================================================
@@ -936,50 +1064,91 @@ def add_expense():
     if category_id is None:
         abort(404)
 
-    db = get_db_connection()
 
-    cursor = db.cursor()
+    # Validate amount: numeric, finite, and strictly positive.
+
+    try:
+        amount_value = round(float(amount), 2)
+    except (TypeError, ValueError):
+        amount_value = None
+
+    if amount_value is None or not math.isfinite(amount_value) or amount_value <= 0:
+        flash("Enter a valid, positive amount.", "error")
+        return redirect(url_for("home"))
 
 
-    query = """
-        INSERT INTO expenses
-        (
-            user_id,
-            category_id,
-            amount,
-            note,
-            expense_date
+    # Validate expense_date: must be a real date in YYYY-MM-DD form.
+    # Future dates are allowed.
+
+    try:
+        datetime.strptime(expense_date, "%Y-%m-%d")
+    except ValueError:
+        flash("Enter a valid expense date (YYYY-MM-DD).", "error")
+        return redirect(url_for("home"))
+
+
+    # Validate note length against the column size.
+
+    if len(note) > 255:
+        flash("Note must be 255 characters or fewer.", "error")
+        return redirect(url_for("home"))
+
+
+    db = None
+
+    cursor = None
+
+    try:
+        db = get_db_connection()
+
+        cursor = db.cursor()
+
+
+        query = """
+            INSERT INTO expenses
+            (
+                user_id,
+                category_id,
+                amount,
+                note,
+                expense_date
+            )
+            VALUES
+            (
+                %s,
+                %s,
+                %s,
+                %s,
+                %s
+            )
+        """
+
+
+        cursor.execute(
+            "SELECT id FROM categories WHERE id = %s AND user_id = %s",
+            (category_id, current_user.id),
         )
-        VALUES
-        (
-            %s,
-            %s,
-            %s,
-            %s,
-            %s
-        )
-    """
+        if cursor.fetchone() is None:
+            abort(404)
+
+        cursor.execute(query, (current_user.id, category_id, amount_value, note, expense_date))
 
 
-    cursor.execute(
-        "SELECT id FROM categories WHERE id = %s AND user_id = %s",
-        (category_id, current_user.id),
-    )
-    if cursor.fetchone() is None:
-        cursor.close()
-        db.close()
-        abort(404)
+        db.commit()
+    except mysql.connector.Error:
+        if db is not None:
+            db.rollback()
+        flash("Unable to save the expense. Please try again.", "error")
+        return redirect(url_for("home"))
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if db is not None:
+            db.close()
 
-    cursor.execute(query, (current_user.id, category_id, amount, note, expense_date))
-
-
-    db.commit()
-
-
-    cursor.close()
-
-    db.close()
-
+    # Invalidate ML cache and set skip flag for immediate redirect
+    _invalidate_ml_cache(current_user.id)
+    session['skip_ml_calculation'] = True
 
     return redirect(url_for("home"))
 
@@ -995,35 +1164,46 @@ def add_expense():
 @login_required
 def delete_expense(expense_id):
 
-    db = get_db_connection()
+    db = None
 
-    cursor = db.cursor()
+    cursor = None
 
+    try:
+        db = get_db_connection()
 
-    query = """
-        DELETE FROM expenses
-        WHERE id = %s AND user_id = %s
-    """
-
-
-    cursor.execute(
-        query,
-        (expense_id, current_user.id)
-    )
-
-    if cursor.rowcount != 1:
-        db.rollback()
-        cursor.close()
-        db.close()
-        abort(404)
-
-    db.commit()
+        cursor = db.cursor()
 
 
-    cursor.close()
+        query = """
+            DELETE FROM expenses
+            WHERE id = %s AND user_id = %s
+        """
 
-    db.close()
 
+        cursor.execute(
+            query,
+            (expense_id, current_user.id)
+        )
+
+        if cursor.rowcount != 1:
+            db.rollback()
+            abort(404)
+
+        db.commit()
+    except mysql.connector.Error:
+        if db is not None:
+            db.rollback()
+        flash("Unable to delete the expense. Please try again.", "error")
+        return redirect(url_for("home"))
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if db is not None:
+            db.close()
+
+    # Invalidate ML cache and set skip flag for immediate redirect
+    _invalidate_ml_cache(current_user.id)
+    session['skip_ml_calculation'] = True
 
     return redirect(url_for("home"))
 
@@ -1038,47 +1218,57 @@ def delete_expense(expense_id):
 @login_required
 def edit_expense(expense_id):
 
-    db = get_db_connection()
+    db = None
 
-    cursor = db.cursor(
-        dictionary=True
-    )
+    cursor = None
 
+    try:
+        db = get_db_connection()
 
-    query = """
-        SELECT
-            id,
-            amount,
-            category_id,
-            note,
-            expense_date
-        FROM expenses
-        WHERE id = %s AND user_id = %s
-    """
+        cursor = db.cursor(
+            dictionary=True
+        )
 
 
-    cursor.execute(
-        query,
-        (expense_id, current_user.id)
-    )
+        query = """
+            SELECT
+                id,
+                amount,
+                category_id,
+                note,
+                expense_date
+            FROM expenses
+            WHERE id = %s AND user_id = %s
+        """
 
 
-    expense = cursor.fetchone()
+        cursor.execute(
+            query,
+            (expense_id, current_user.id)
+        )
 
 
-    if expense is None:
-        cursor.close()
-        db.close()
-        abort(404)
+        expense = cursor.fetchone()
 
-    cursor.execute(
-        "SELECT id, name FROM categories WHERE user_id = %s ORDER BY name",
-        (current_user.id,),
-    )
-    categories = cursor.fetchall()
 
-    cursor.close()
-    db.close()
+        if expense is None:
+            abort(404)
+
+        cursor.execute(
+            "SELECT id, name FROM categories WHERE user_id = %s ORDER BY name",
+            (current_user.id,),
+        )
+        categories = cursor.fetchall()
+    except mysql.connector.Error:
+        if db is not None:
+            db.rollback()
+        flash("Unable to load the expense. Please try again.", "error")
+        return redirect(url_for("home"))
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if db is not None:
+            db.close()
 
     return render_template(
         "edit_expense.html",
@@ -1110,54 +1300,244 @@ def update_expense(expense_id):
     if category_id is None:
         abort(404)
 
+
+    # Validate amount: numeric, finite, and strictly positive.
+
+    try:
+        amount_value = round(float(amount), 2)
+    except (TypeError, ValueError):
+        amount_value = None
+
+    if amount_value is None or not math.isfinite(amount_value) or amount_value <= 0:
+        flash("Enter a valid, positive amount.", "error")
+        return redirect(url_for("home"))
+
+
+    # Validate expense_date: must be a real date in YYYY-MM-DD form.
+    # Future dates are allowed.
+
+    try:
+        datetime.strptime(expense_date, "%Y-%m-%d")
+    except ValueError:
+        flash("Enter a valid expense date (YYYY-MM-DD).", "error")
+        return redirect(url_for("home"))
+
+
+    # Validate note length against the column size.
+
+    if len(note) > 255:
+        flash("Note must be 255 characters or fewer.", "error")
+        return redirect(url_for("home"))
+
+
+    db = None
+
+    cursor = None
+
+    try:
+        db = get_db_connection()
+
+        cursor = db.cursor()
+
+
+        query = """
+            UPDATE expenses
+
+            SET
+                amount = %s,
+                category_id = %s,
+                expense_date = %s,
+                note = %s
+
+            WHERE id = %s AND user_id = %s
+        """
+
+
+        cursor.execute(
+            "SELECT id FROM categories WHERE id = %s AND user_id = %s",
+            (category_id, current_user.id),
+        )
+        if cursor.fetchone() is None:
+            abort(404)
+
+        cursor.execute(
+            query,
+            (amount_value, category_id, expense_date, note, expense_id, current_user.id)
+        )
+
+        if cursor.rowcount != 1:
+            db.rollback()
+            abort(404)
+
+        db.commit()
+    except mysql.connector.Error:
+        if db is not None:
+            db.rollback()
+        flash("Unable to update the expense. Please try again.", "error")
+        return redirect(url_for("home"))
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if db is not None:
+            db.close()
+
+    # Invalidate ML cache and set skip flag for immediate redirect
+    _invalidate_ml_cache(current_user.id)
+    session['skip_ml_calculation'] = True
+
+    return redirect(url_for("home"))
+
+
+# =====================================================
+# SET / UPDATE CATEGORY BUDGET
+# =====================================================
+
+@app.route(
+    "/set-budget",
+    methods=["POST"]
+)
+@login_required
+def set_budget():
+
+    category_id = request.form.get("category_id", type=int)
+
+    monthly_budget = request.form.get("monthly_budget", "").strip()
+
+    selected_month = request.form.get("month", "").strip()
+
+    filter_category = request.form.get("filter_category_id", "").strip()
+
+
+    if category_id is None:
+        abort(404)
+
+
     db = get_db_connection()
 
     cursor = db.cursor()
 
+    try:
 
-    query = """
-        UPDATE expenses
+        cursor.execute(
+            "SELECT id FROM categories WHERE id = %s AND user_id = %s",
+            (category_id, current_user.id),
+        )
 
-        SET
-            amount = %s,
-            category_id = %s,
-            expense_date = %s,
-            note = %s
+        if cursor.fetchone() is None:
+            abort(404)
 
-        WHERE id = %s AND user_id = %s
+
+        try:
+            budget_value = round(float(monthly_budget), 2)
+        except (TypeError, ValueError):
+            budget_value = None
+
+        if budget_value is None or not math.isfinite(budget_value) or budget_value < 0:
+            flash("Enter a valid, non-negative budget amount.", "error")
+            return redirect(url_for("home", month=selected_month, category_id=filter_category))
+
+
+        cursor.execute(
+            """
+            UPDATE categories
+            SET monthly_budget = %s
+            WHERE id = %s AND user_id = %s
+            """,
+            (budget_value, category_id, current_user.id),
+        )
+
+        if cursor.rowcount != 1:
+            db.rollback()
+            abort(404)
+
+        db.commit()
+
+    except mysql.connector.Error:
+        if db is not None:
+            db.rollback()
+        flash("Unable to update the budget. Please try again.", "error")
+        return redirect(url_for("home", month=selected_month, category_id=filter_category))
+
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if db is not None:
+            db.close()
+
+
+    flash("Budget updated successfully.", "success")
+
+    return redirect(url_for("home", month=selected_month, category_id=filter_category))
+
+
+# =====================================================
+# GLOBAL ERROR HANDLERS
+# =====================================================
+# Present friendly pages for missing pages (404) and unhandled errors (500).
+# Exception details and stack traces are logged server-side only and are
+# never rendered to the client.
+
+_ERROR_PAGE_404 = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Page Not Found</title>
+</head>
+<body style="font-family:Arial,sans-serif;text-align:center;padding:4rem 1rem;">
+<h1>404 - Page Not Found</h1>
+<p>Sorry, the page you are looking for does not exist or may have moved.</p>
+<a href="/">Back to home</a>
+</body>
+</html>"""
+
+_ERROR_PAGE_500 = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Something Went Wrong</title>
+</head>
+<body style="font-family:Arial,sans-serif;text-align:center;padding:4rem 1rem;">
+<h1>Something went wrong</h1>
+<p>An unexpected error occurred. The incident has been logged, so please try
+again in a moment.</p>
+<a href="/">Back to home</a>
+</body>
+</html>"""
+
+
+@app.errorhandler(404)
+def handle_404(error):
+    """Return a friendly page for missing pages or resources."""
+    return _ERROR_PAGE_404, 404
+
+
+@app.errorhandler(500)
+def handle_500(error):
+    """Log the failure and show a friendly page, hiding all exception detail.
+
+    Rolls back the current transaction when a database connection is available
+    through the application's existing connection helper. If the database
+    itself is the source of the failure, no connection is available and the
+    rollback is skipped silently.
     """
+    app.logger.exception("Unhandled server error")
 
-
-    cursor.execute(
-        "SELECT id FROM categories WHERE id = %s AND user_id = %s",
-        (category_id, current_user.id),
-    )
-    if cursor.fetchone() is None:
-        cursor.close()
-        db.close()
-        abort(404)
-
-    cursor.execute(
-        query,
-        (amount, category_id, expense_date, note, expense_id, current_user.id)
-    )
-
-    if cursor.rowcount != 1:
+    db = None
+    try:
+        db = get_db_connection()
         db.rollback()
-        cursor.close()
-        db.close()
-        abort(404)
+    except Exception:
+        # No connection is available (e.g. the database is down); there is
+        # nothing to roll back.
+        pass
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
 
-    db.commit()
-
-
-    cursor.close()
-
-    db.close()
-
-
-    return redirect(url_for("home"))
-
+    return _ERROR_PAGE_500, 500
 
 # =====================================================
 # RUN APPLICATION

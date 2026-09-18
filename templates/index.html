@@ -175,6 +175,9 @@
   .progress-bar{height:100%;border-radius:20px;background:var(--gold);transition:width 0.6s ease;}
   .progress-bar.over{background:var(--brick);}
   .budget-status{display:flex;justify-content:space-between;margin-top:7px;font-size:11px;color:var(--ink-soft);}
+  .budget-form{display:flex;gap:8px;margin-top:12px;align-items:center;}
+  .budget-input{flex:1;min-width:0;padding:8px 10px;font-size:12px;}
+  .budget-save{padding:8px 14px;font-size:11px;}
 
   /* ---------- TABLE ---------- */
   .table-card{overflow-x:auto;}
@@ -375,6 +378,8 @@
           {% elif insight.startswith('📉') %}tone-down
           {% elif insight.startswith('✅') %}tone-ok
           {% elif insight.startswith('💰') %}tone-money
+          {% elif insight.startswith('💡') %}tone-money
+          {% elif insight.startswith('➡') %}tone-ok
           {% endif %}">
           {{ insight }}
         </div>
@@ -545,6 +550,14 @@
           {% else %}
             <div class="budget-status"><span>No budget configured</span></div>
           {% endif %}
+          <form method="POST" action="{{ url_for('set_budget') }}" class="budget-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="category_id" value="{{ item.id }}">
+            <input type="hidden" name="month" value="{{ selected_month or '' }}">
+            <input type="hidden" name="filter_category_id" value="{{ selected_category or '' }}">
+            <input type="number" name="monthly_budget" class="budget-input" step="0.01" min="0" placeholder="Monthly budget" value="{% if item.budget > 0 %}{{ "%.2f"|format(item.budget) }}{% endif %}">
+            <button type="submit" class="btn-primary budget-save">Save</button>
+          </form>
         </div>
         {% endfor %}
       </div>
