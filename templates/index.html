@@ -116,6 +116,10 @@
   .insight-item.tone-money{border-left-color:var(--gold);}
 
   /* ---------- ANOMALY ---------- */
+  .anomaly-stats{display:flex;flex-wrap:wrap;gap:8px 22px;margin-top:12px;font-size:12px;color:var(--ink-soft);}
+  .anomaly-stats strong{color:var(--ink);font-family:'IBM Plex Mono',monospace;}
+  .anomaly-note{margin-top:8px;font-size:11px;color:var(--ink-soft);opacity:.8;}
+
   .anomaly-status{
     margin-bottom:16px;padding:12px 15px;border-radius:4px;font-size:13px;
     background:rgba(156,75,62,0.07);border:1px solid rgba(156,75,62,0.2);color:var(--ink);
@@ -407,6 +411,19 @@
       {% if anomaly_message %}
       <div class="anomaly-status">{{ anomaly_message }}</div>
       {% endif %}
+      {% if anomaly_evaluated %}
+      <div class="anomaly-stats">
+        <span><strong>{{ anomaly_evaluated }}</strong> transactions evaluated</span>
+        <span><strong>{{ anomaly_count }}</strong> flagged as unusual</span>
+        {% if anomaly_rate is not none %}
+        <span><strong>{{ "%.1f"|format(anomaly_rate) }}%</strong> anomaly rate</span>
+        {% endif %}
+        {% if score_min is not none %}
+        <span>decision score {{ score_min }} &rarr; {{ score_max }} (avg {{ score_mean }})</span>
+        {% endif %}
+      </div>
+      <div class="anomaly-note">Unsupervised model: no ground-truth labels exist, so classification accuracy cannot be calculated.</div>
+      {% endif %}
 
       {% if anomalies %}
       <div class="anomaly-list">
@@ -467,13 +484,27 @@
           <div class="mae-number">&#8377;{{ "%.2f"|format(mae) }}</div>
           <div class="mae-label">Mean Absolute Error (MAE)</div>
           <div class="model-divider"></div>
-          <div class="model-info"><span>Evaluation method</span><span>Hold-out test</span></div>
-          <div class="model-info"><span>Test data</span><span>Latest month</span></div>
+          <div class="model-info"><span>Evaluation method</span><span>Walk-forward</span></div>
+          <div class="model-info note" style="grid-template-columns:1fr;font-size:11px;color:var(--ink-soft);">Each month was predicted by a model trained only on earlier months, so every score is out-of-sample.</div>
+          <div class="model-divider"></div>
+          <div class="model-info"><span>Months evaluated</span><span>{{ eval_months }}</span></div>
+          <div class="model-info"><span>Test data</span><span>Unseen future months</span></div>
+          <div class="model-info"><span>RMSE</span><span>&#8377;{{ "%.2f"|format(rmse) }}</span></div>
+          {% if r2 is not none %}
+          <div class="model-info"><span>R&sup2; score</span><span>{{ "%.2f"|format(r2) }}</span></div>
+          {% else %}
+          <div class="model-info"><span>R&sup2; score</span><span>Needs 2+ eval months</span></div>
+          {% endif %}
+          {% if mape is not none %}
+          <div class="model-info"><span>MAPE</span><span>{{ "%.1f"|format(mape) }}%</span></div>
+          {% else %}
+          <div class="model-info"><span>MAPE</span><span>Undefined (zero actual)</span></div>
+          {% endif %}
           {% else %}
           <div class="mae-number">--</div>
           <div class="mae-label">MAE unavailable</div>
           <div class="model-divider"></div>
-          <div class="model-info"><span>Requirement</span><span>4+ months</span></div>
+          <div class="model-info"><span>Requirement</span><span>3+ months</span></div>
           {% endif %}
         </div>
       </div>

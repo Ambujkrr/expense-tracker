@@ -81,7 +81,25 @@ class FakeCursor:
         elif "C.MONTHLY_BUDGET AS BUDGET" in text:
             self._list = self.store["budget_rows"]
         elif "FROM EXPENSES E" in text:
-            self._list = self.store["expense_list"]
+            # Honor the same category/month filters the real dashboard
+            # query carries, so tests can assert filter-specific
+            # expense sets and filter-scoped anomaly results.
+            rows = list(self.store["expense_list"])
+            rest = list(params[1:]) if params else []
+            if "AND E.CATEGORY_ID = %S" in text:
+                category_id = rest.pop(0)
+                rows = [
+                    r for r in rows
+                    if str(r["category_id"]) == str(category_id)
+                ]
+            if "E.EXPENSE_DATE >= %S" in text:
+                start = str(rest.pop(0))[:10]
+                end = str(rest.pop(0))[:10]
+                rows = [
+                    r for r in rows
+                    if start <= str(r["expense_date"])[:10] < end
+                ]
+            self._list = rows
         else:
             self._row = {"id": 1, "name": "Food"}
 

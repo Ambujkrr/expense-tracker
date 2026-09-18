@@ -46,10 +46,130 @@ DEFAULT_CATEGORIES = ("Food", "Transport", "Entertainment", "Shopping", "Educati
 # Invalidated on expense mutations (add/update/delete)
 _ml_cache = {}
 
+def _ml_cache_key(user_id, category_id, month):
+    """Build the ML cache key from the active dashboard filters.
+
+    Prediction, evaluation and anomaly results are all derived from a
+    filter-specific expense set, so the key must carry those filters.
+    Without them a result computed for one combination (e.g. no filter)
+    could be served for another (e.g. Category=Entertainment).
+    """
+    return (user_id, category_id, month)
+
+
 def _invalidate_ml_cache(user_id):
-    """Invalidate ML cache for specific user"""
-    _ml_cache.pop(user_id, None)
+    """Invalidate every ML cache entry for a user.
+
+    Entries are keyed by (user_id, category_id, month), so a single
+    expense mutation must drop all of that user filter variants.
+    """
+    for key in [k for k in _ml_cache if k[0] == user_id]:
+        _ml_cache.pop(key, None)
     print(f"[CACHE] Invalidated ML cache for user_id={user_id}", flush=True)
+
+def _walk_forward_evaluate(monthly_totals, min_train=2):
+    """Walk-forward (expanding-window) evaluation of the forecast model.
+
+    For each available month N, a Linear Regression is trained on months
+    1..N-1 only and then used to predict month N. Every prediction is
+    therefore genuinely out-of-sample: no month is ever predicted by a
+    model that saw that month (or any later month) during training.
+
+    Returns a dict of aggregate metrics (mae, rmse, r2, mape) plus the
+    number of out-of-sample months evaluated. Each metric is None when it
+    is not mathematically defined for the collected predictions:
+      - MAPE is None if any actual value is zero (division by zero).
+      - R2 is None unless there are 2+ predictions with non-zero variance.
+    Returns an explicit insufficient-data state (all None, n=0) when too
+    few months exist to produce even one out-of-sample prediction.
+    """
+    values = [float(v) for v in monthly_totals]
+
+    # Need at least min_train months of history before the first
+    # out-of-sample month, plus that month itself.
+    if len(values) < min_train + 1:
+        return {"mae": None, "rmse": None, "r2": None, "mape": None, "n": 0}
+
+    y_true = []
+    y_pred = []
+
+    for split in range(min_train, len(values)):
+        train_X = [[i + 1] for i in range(split)]
+        train_y = values[:split]
+
+        model = LinearRegression()
+        model.fit(train_X, train_y)
+
+        # Predict month index `split`, which the model has never seen.
+        predicted = model.predict([[split + 1]])[0]
+        predicted = max(0.0, float(predicted))
+
+        y_true.append(values[split])
+        y_pred.append(predicted)
+
+    return _eval_regression(y_true, y_pred)
+
+
+def _eval_regression(y_true, y_pred):
+    """Compute regression metrics for a set of predictions.
+
+    Pure function: takes parallel actual/predicted values and returns only
+    the metrics that are mathematically defined for the available data.
+
+    - MAPE is reported only when every actual value is non-zero, otherwise
+      it would divide by zero.
+    - R2 is reported only when the actual values have non-zero variance.
+      With a single test month (the dashboard hold-out) R2 is undefined, so
+      None is returned rather than a misleading perfect score.
+    - An empty input means insufficient historical data; all metrics None.
+    """
+    y_true = [float(v) for v in y_true]
+    y_pred = [float(v) for v in y_pred]
+    n = len(y_true)
+
+    if n == 0:
+        return {"mae": None, "rmse": None, "r2": None, "mape": None, "n": 0}
+
+    errors = [actual - predicted for actual, predicted in zip(y_true, y_pred)]
+
+    mae = sum(abs(e) for e in errors) / n
+    rmse = math.sqrt(sum(e * e for e in errors) / n)
+
+    if all(v != 0 for v in y_true):
+        mape = sum(abs(e) / abs(t) for e, t in zip(errors, y_true)) / n * 100
+    else:
+        mape = None
+
+    mean_true = sum(y_true) / n
+    ss_tot = sum((t - mean_true) ** 2 for t in y_true)
+    if n >= 2 and ss_tot > 0:
+        ss_res = sum(e * e for e in errors)
+        r2 = 1 - (ss_res / ss_tot)
+    else:
+        r2 = None
+
+    return {
+        "mae": round(mae, 2),
+        "rmse": round(rmse, 2),
+        "r2": round(r2, 2) if r2 is not None else None,
+        "mape": round(mape, 1) if mape is not None else None,
+        "n": n,
+    }
+
+
+def _anomaly_rate(n_evaluated, n_anomalies):
+    """Anomaly rate as a percentage, or None when nothing was evaluated.
+
+    Isolation Forest runs unsupervised here: the application has no
+    ground-truth anomaly labels, so classification accuracy, precision and
+    recall cannot be calculated for it.
+    """
+    n_evaluated = int(n_evaluated or 0)
+    n_anomalies = int(n_anomalies or 0)
+    if n_evaluated <= 0:
+        return None
+    return round(n_anomalies / n_evaluated * 100, 1)
+
 
 
 class User(UserMixin):
@@ -526,6 +646,14 @@ def home():
 
     mae_message = None
 
+    rmse = None
+
+    r2 = None
+
+    mape = None
+
+    eval_months = 0
+
 
     # =================================================
     # ML CALCULATION WITH CACHING
@@ -539,10 +667,19 @@ def home():
         prediction_message = "Recalculating prediction..."
         mae = None
         mae_message = "Recalculating model evaluation..."
+        rmse = None
+
+        r2 = None
+
+        mape = None
+
+        eval_months = 0
         print(f"[PERF] Skipped ML calculation: {time.perf_counter() - ml_start:.3f}s", flush=True)
     else:
         # Check if ML results are cached
-        cached_ml = _ml_cache.get(current_user.id)
+        cached_ml = _ml_cache.get(
+            _ml_cache_key(current_user.id, category_id, month)
+        )
 
         if cached_ml:
             # Use cached results
@@ -551,6 +688,10 @@ def home():
             prediction_message = cached_ml.get("prediction_message")
             mae = cached_ml.get("mae")
             mae_message = cached_ml.get("mae_message")
+            rmse = cached_ml.get("rmse")
+            r2 = cached_ml.get("r2")
+            mape = cached_ml.get("mape")
+            eval_months = cached_ml.get("eval_months", 0)
             print(f"[CACHE] Using cached ML prediction for user_id={current_user.id}", flush=True)
             print(f"[PERF] Linear Regression + MAE (cached): {time.perf_counter() - ml_start:.3f}s", flush=True)
         else:
@@ -655,96 +796,46 @@ def home():
 
 
                 # =================================================
-                # MODEL EVALUATION USING MAE
+                # MODEL EVALUATION - WALK-FORWARD
                 # =================================================
                 #
-                # We keep the latest month as test data.
+                # Each month is predicted by a model trained only on
+                # the months before it (expanding window), so every
+                # score is out-of-sample. Requires at least 3 months:
+                # two to train, one to evaluate.
                 #
-                # Example:
+                # Example with 5 months of history:
                 #
-                # May     -> training
-                # June    -> training
-                # July    -> training
-                # August  -> test
-                #
-                # Then we predict August and compare it with
-                # the actual August spending.
+                #   train M1..M2  -> predict M3
+                #   train M1..M3  -> predict M4
+                #   train M1..M4  -> predict M5
                 # =================================================
 
-                if len(monthly_summary) >= 4:
+                eval_metrics = _walk_forward_evaluate(y)
 
+                if eval_metrics["n"] > 0:
 
-                    # -----------------------------------------
-                    # TRAINING DATA
-                    # -----------------------------------------
+                    mae = eval_metrics["mae"]
 
-                    train_X = X[:-1]
+                    rmse = eval_metrics["rmse"]
 
-                    train_y = y[:-1]
+                    r2 = eval_metrics["r2"]
 
+                    mape = eval_metrics["mape"]
 
-                    # -----------------------------------------
-                    # TEST DATA
-                    # -----------------------------------------
-
-                    test_X = X[-1:]
-
-                    test_y = y[-1:]
-
-
-                    # -----------------------------------------
-                    # CREATE EVALUATION MODEL
-                    # -----------------------------------------
-
-                    evaluation_model = LinearRegression()
-
-
-                    evaluation_model.fit(
-                        train_X,
-                        train_y
-                    )
-
-
-                    # -----------------------------------------
-                    # PREDICT TEST MONTH
-                    # -----------------------------------------
-
-                    test_prediction = (
-                        evaluation_model.predict(
-                            test_X
-                        )
-                    )
-
-
-                    # -----------------------------------------
-                    # CALCULATE MAE
-                    # -----------------------------------------
-
-                    mae_value = mean_absolute_error(
-                        test_y,
-                        test_prediction
-                    )
-
-
-                    mae = round(
-                        float(mae_value),
-                        2
-                    )
-
+                    eval_months = eval_metrics["n"]
 
                     mae_message = (
-                        "Latest month was used as test data "
-                        "for MAE evaluation."
+                        f"Walk-forward evaluation across {eval_months} "
+                        f"unseen month(s)."
                     )
-
 
                 else:
 
                     mae_message = (
-                        "Add expenses across at least 4 "
+                        "Add expenses across at least 3 "
                         "different months to calculate MAE."
                     )
-
 
             else:
 
@@ -760,12 +851,16 @@ def home():
                 )
 
             # Cache the computed ML results
-            _ml_cache[current_user.id] = {
+            _ml_cache[_ml_cache_key(current_user.id, category_id, month)] = {
                 "prediction": prediction,
                 "prediction_month": prediction_month,
                 "prediction_message": prediction_message,
                 "mae": mae,
-                "mae_message": mae_message
+                "mae_message": mae_message,
+                "rmse": rmse,
+                "r2": r2,
+                "mape": mape,
+                "eval_months": eval_months
             }
             print(f"[CACHE] Stored ML prediction for user_id={current_user.id}", flush=True)
             print(
@@ -944,21 +1039,43 @@ def home():
     anomaly_message = None
     anomaly_count = 0
 
+    anomaly_evaluated = 0
+
+    anomaly_rate = None
+
+    score_min = None
+
+    score_max = None
+
+    score_mean = None
+
     if skip_ml:
         # Skip anomaly detection after expense mutation for immediate response
         anomalies = []
         anomaly_count = 0
         anomaly_message = "Recalculating anomaly detection..."
+        anomaly_evaluated = 0
+        anomaly_rate = None
+        score_min = None
+        score_max = None
+        score_mean = None
         print(f"[PERF] Skipped Isolation Forest: {time.perf_counter() - anomaly_start:.3f}s", flush=True)
     else:
         # Check if anomaly results are cached
-        cached_ml = _ml_cache.get(current_user.id)
+        cached_ml = _ml_cache.get(
+            _ml_cache_key(current_user.id, category_id, month)
+        )
 
         if cached_ml and "anomalies" in cached_ml:
             # Use cached anomaly results
             anomalies = cached_ml.get("anomalies", [])
             anomaly_count = cached_ml.get("anomaly_count", 0)
             anomaly_message = cached_ml.get("anomaly_message")
+            anomaly_evaluated = cached_ml.get("anomaly_evaluated", 0)
+            anomaly_rate = cached_ml.get("anomaly_rate")
+            score_min = cached_ml.get("score_min")
+            score_max = cached_ml.get("score_max")
+            score_mean = cached_ml.get("score_mean")
             print(f"[CACHE] Using cached anomaly detection for user_id={current_user.id}", flush=True)
             print(f"[PERF] Isolation Forest (cached): {time.perf_counter() - anomaly_start:.3f}s", flush=True)
         else:
@@ -1023,6 +1140,20 @@ def home():
                         "No unusual expenses detected."
                     )
 
+                # Unsupervised evaluation stats. No ground-truth labels
+                # exist, so accuracy/precision/recall are not reported.
+                anomaly_evaluated = len(expenses)
+
+                anomaly_rate = _anomaly_rate(anomaly_evaluated, anomaly_count)
+
+                scores = [float(s) for s in anomaly_scores]
+
+                score_min = round(min(scores), 4)
+
+                score_max = round(max(scores), 4)
+
+                score_mean = round(sum(scores) / len(scores), 4)
+
             else:
 
                 anomaly_message = (
@@ -1030,14 +1161,25 @@ def home():
                     "unusual spending patterns."
                 )
 
+                anomaly_evaluated = len(expenses)
+
+                anomaly_rate = None
+
             # Update cache with anomaly results
-            cache_entry = _ml_cache.get(current_user.id, {})
+            cache_entry = _ml_cache.get(
+                _ml_cache_key(current_user.id, category_id, month), {}
+            )
             cache_entry.update({
                 "anomalies": anomalies,
                 "anomaly_count": anomaly_count,
-                "anomaly_message": anomaly_message
+                "anomaly_message": anomaly_message,
+                "anomaly_evaluated": anomaly_evaluated,
+                "anomaly_rate": anomaly_rate,
+                "score_min": score_min,
+                "score_max": score_max,
+                "score_mean": score_mean
             })
-            _ml_cache[current_user.id] = cache_entry
+            _ml_cache[_ml_cache_key(current_user.id, category_id, month)] = cache_entry
             print(f"[CACHE] Stored anomaly detection for user_id={current_user.id}", flush=True)
             print(
                 f"[PERF] Isolation Forest: "
@@ -1083,13 +1225,31 @@ def home():
 
         mae_message=mae_message,
 
+        rmse=rmse,
+
+        r2=r2,
+
+        mape=mape,
+
+        eval_months=eval_months,
+
         insights=insights,
 
         anomalies=anomalies,
 
         anomaly_count=anomaly_count,
 
-        anomaly_message=anomaly_message
+        anomaly_message=anomaly_message,
+
+        anomaly_evaluated=anomaly_evaluated,
+
+        anomaly_rate=anomaly_rate,
+
+        score_min=score_min,
+
+        score_max=score_max,
+
+        score_mean=score_mean
     )
     print(
     f"[PERF] TOTAL HOME REQUEST: "
