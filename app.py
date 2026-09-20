@@ -9,8 +9,7 @@ import secrets
 import time
 import threading
 from datetime import datetime, timedelta, timezone
-from email.message import EmailMessage
-import smtplib
+import resend
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error
 from sklearn.ensemble import IsolationForest
@@ -54,14 +53,6 @@ MAX_OTP_ATTEMPTS = int(os.environ.get("MAX_OTP_ATTEMPTS", "5"))
 OTP_RESEND_COOLDOWN_SECONDS = int(os.environ.get("OTP_RESEND_COOLDOWN_SECONDS", "60"))
 MAX_OTP_HOURLY_EMAIL = int(os.environ.get("MAX_OTP_HOURLY_EMAIL", "5"))
 MAX_OTP_HOURLY_IP = int(os.environ.get("MAX_OTP_HOURLY_IP", "10"))
-
-SMTP_SERVER = os.environ.get("SMTP_SERVER")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
-SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "1").lower() in ("1", "true", "yes")
-SMTP_USE_SSL = os.environ.get("SMTP_USE_SSL", "0").lower() in ("1", "true", "yes")
-SMTP_TIMEOUT = int(os.environ.get("SMTP_TIMEOUT", "10"))
 MAIL_DEFAULT_SENDER = os.environ.get("MAIL_DEFAULT_SENDER", "Expense Tracker <noreply@expensetracker.local>")
 
 # Hook for overriding email delivery during testing or mocking
@@ -432,8 +423,7 @@ def _get_client_ip():
 def _send_otp_email(to_email, otp):
     """Deliver a 6-digit OTP code to the recipient's email address.
 
-    Uses Python's standard smtplib and EmailMessage modules so no external
-    dependencies are required. Never logs passwords, API keys, or plaintext OTPs.
+    Uses the Resend Python SDK. Never logs passwords, API keys, or plaintext OTPs.
     """
     global _email_sender_hook
     if _email_sender_hook is not None:
@@ -442,14 +432,12 @@ def _send_otp_email(to_email, otp):
     if app.config.get("TESTING"):
         return True
 
-    if not SMTP_SERVER:
-        app.logger.warning("[SMTP] SMTP_SERVER not configured; email delivery skipped.")
+    resend_api_key = os.environ.get("RESEND_API_KEY")
+    if not resend_api_key:
+        app.logger.warning("[Email] RESEND_API_KEY not configured; email delivery skipped.")
         return False
 
-    msg = EmailMessage()
-    msg["Subject"] = "Your Password Reset Verification Code - Ledger"
-    msg["From"] = MAIL_DEFAULT_SENDER
-    msg["To"] = to_email
+    resend.api_key = resend_api_key
 
     text_content = (
         "Hello,\n\n"
@@ -481,24 +469,18 @@ def _send_otp_email(to_email, otp):
 </body>
 </html>"""
 
-    msg.set_content(text_content)
-    msg.add_alternative(html_content, subtype="html")
-
     try:
-        if SMTP_USE_SSL:
-            server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=SMTP_TIMEOUT)
-        else:
-            server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=SMTP_TIMEOUT)
-        with server:
-            if SMTP_USE_TLS and not SMTP_USE_SSL:
-                server.starttls()
-            if SMTP_USERNAME and SMTP_PASSWORD:
-                server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            server.send_message(msg)
+        resend.Emails.send({
+            "from": MAIL_DEFAULT_SENDER,
+            "to": to_email,
+            "subject": "Your Password Reset Verification Code - Ledger",
+            "text": text_content,
+            "html": html_content
+        })
         return True
     except Exception as exc:
         app.logger.warning(
-            "[SMTP] Failed to deliver email: %s - %s",
+            "[Email] Failed to deliver email: %s - %s",
             type(exc).__name__,
             str(exc),
         )

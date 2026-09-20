@@ -127,12 +127,7 @@ in the repository:
 | `SECRET_KEY` | Production | Flask session key; a random one is generated in development |
 | `FLASK_ENV` | No | Set to `production` to enable production settings |
 | `FLASK_DEBUG` | No | Set to `1` to enable debug mode |
-| `SMTP_SERVER` | Production | SMTP server host (e.g. `smtp.gmail.com`, `smtp.sendgrid.net`) |
-| `SMTP_PORT` | No | SMTP port (defaults to `587`) |
-| `SMTP_USERNAME` | Production | SMTP authentication username / email |
-| `SMTP_PASSWORD` | Production | SMTP authentication password / app key |
-| `SMTP_USE_TLS` | No | Enable STARTTLS (defaults to `1` / true) |
-| `SMTP_USE_SSL` | No | Enable SSL direct connection (defaults to `0` / false) |
+| `RESEND_API_KEY` | Production | Resend API key for email delivery |
 | `MAIL_DEFAULT_SENDER` | No | Outgoing email sender (defaults to `Expense Tracker <noreply@expensetracker.local>`) |
 | `OTP_EXPIRY_MINUTES` | No | OTP validity duration (defaults to `10` minutes) |
 | `MAX_OTP_ATTEMPTS` | No | Max invalid OTP attempts before lockout (defaults to `5`) |
