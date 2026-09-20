@@ -497,7 +497,11 @@ def _send_otp_email(to_email, otp):
             server.send_message(msg)
         return True
     except Exception as exc:
-        app.logger.warning("[SMTP] Failed to deliver email: %s", type(exc).__name__)
+        app.logger.warning(
+            "[SMTP] Failed to deliver email: %s - %s",
+            type(exc).__name__,
+            str(exc),
+        )
         return False
 
 
