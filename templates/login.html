@@ -23,6 +23,7 @@
       <div class="field"><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required></div>
       <button type="submit">Sign in</button>
     </form>
+    <p style="margin-top: 14px;"><a href="{{ url_for('forgot_password') }}">Forgot password?</a></p>
     <p>New here? <a href="{{ url_for('register') }}">Create an account</a>.</p>
   </main>
 </body>

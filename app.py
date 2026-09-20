@@ -8,13 +8,22 @@ import re
 import secrets
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+import smtplib
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error
 from sklearn.ensemble import IsolationForest
+import hashlib
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(
+    app.wsgi_app,
+    x_for=1,
+    x_proto=1
+)
 
 is_production = os.environ.get("FLASK_ENV", "").lower() == "production"
 secret_key = os.environ.get("SECRET_KEY")
@@ -36,6 +45,27 @@ login_manager.login_message_category = "info"
 csrf = CSRFProtect(app)
 
 DEFAULT_CATEGORIES = ("Food", "Transport", "Entertainment", "Shopping", "Education", "Other")
+
+# =====================================================
+# OTP & PASSWORD RESET CONFIGURATION
+# =====================================================
+OTP_EXPIRY_MINUTES = int(os.environ.get("OTP_EXPIRY_MINUTES", "10"))
+MAX_OTP_ATTEMPTS = int(os.environ.get("MAX_OTP_ATTEMPTS", "5"))
+OTP_RESEND_COOLDOWN_SECONDS = int(os.environ.get("OTP_RESEND_COOLDOWN_SECONDS", "60"))
+MAX_OTP_HOURLY_EMAIL = int(os.environ.get("MAX_OTP_HOURLY_EMAIL", "5"))
+MAX_OTP_HOURLY_IP = int(os.environ.get("MAX_OTP_HOURLY_IP", "10"))
+
+SMTP_SERVER = os.environ.get("SMTP_SERVER")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
+SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "1").lower() in ("1", "true", "yes")
+SMTP_USE_SSL = os.environ.get("SMTP_USE_SSL", "0").lower() in ("1", "true", "yes")
+SMTP_TIMEOUT = int(os.environ.get("SMTP_TIMEOUT", "10"))
+MAIL_DEFAULT_SENDER = os.environ.get("MAIL_DEFAULT_SENDER", "Expense Tracker <noreply@expensetracker.local>")
+
+# Hook for overriding email delivery during testing or mocking
+_email_sender_hook = None
 
 # =====================================================
 # ML RESULTS CACHE
@@ -173,10 +203,18 @@ def _anomaly_rate(n_evaluated, n_anomalies):
 
 
 class User(UserMixin):
-    def __init__(self, user_id, username, email):
+    def __init__(self, user_id, username, email, password_hash=None):
         self.id = user_id
         self.username = username
         self.email = email
+        self.password_hash = password_hash
+
+
+def _hash_sig(password_hash):
+    """Compute a truncated cryptographic digest of the password hash to validate sessions."""
+    if not password_hash:
+        return ""
+    return hashlib.sha256(password_hash.encode("utf-8")).hexdigest()[:16]
 
 
 # =====================================================
@@ -250,11 +288,11 @@ def get_user_by_id(user_id):
     cursor = db.cursor(dictionary=True)
     try:
         cursor.execute(
-            "SELECT id, username, email FROM users WHERE id = %s",
+            "SELECT id, username, email, password_hash FROM users WHERE id = %s",
             (user_id,),
         )
         row = cursor.fetchone()
-        return User(row["id"], row["username"], row["email"]) if row else None
+        return User(row["id"], row["username"], row["email"], row.get("password_hash")) if row else None
     finally:
         cursor.close()
         db.close()
@@ -262,7 +300,14 @@ def get_user_by_id(user_id):
 
 @login_manager.user_loader
 def load_user(user_id):
-    return get_user_by_id(user_id)
+    user = get_user_by_id(user_id)
+    if user is None:
+        return None
+    sig = session.get("_password_hash_sig")
+    if sig is not None and user.password_hash:
+        if sig != _hash_sig(user.password_hash):
+            return None
+    return user
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -301,7 +346,8 @@ def login():
                 db.close()
 
         if row and check_password_hash(row["password_hash"], password):
-            login_user(User(row["id"], row["username"], row["email"]))
+            login_user(User(row["id"], row["username"], row["email"], row["password_hash"]))
+            session["_password_hash_sig"] = _hash_sig(row["password_hash"])
             return redirect(url_for("home"))
         flash("Invalid username/email or password.", "error")
 
@@ -338,9 +384,10 @@ def register():
                 if cursor.fetchone():
                     flash("That username or email is already registered.", "error")
                 else:
+                    pwd_hash = generate_password_hash(password)
                     cursor.execute(
                         "INSERT INTO users (username, email, password_hash) VALUES (%s, %s, %s)",
-                        (username, email, generate_password_hash(password)),
+                        (username, email, pwd_hash),
                     )
                     user_id = cursor.lastrowid
                     cursor.executemany(
@@ -348,7 +395,8 @@ def register():
                         [(user_id, name, 0) for name in DEFAULT_CATEGORIES],
                     )
                     db.commit()
-                    login_user(User(user_id, username, email))
+                    login_user(User(user_id, username, email, pwd_hash))
+                    session["_password_hash_sig"] = _hash_sig(pwd_hash)
                     return redirect(url_for("home"))
             except mysql.connector.Error:
                 db.rollback()
@@ -365,6 +413,371 @@ def register():
 def logout():
     logout_user()
     return redirect(url_for("login"))
+
+
+# =====================================================
+# PASSWORD RESET HELPERS & ROUTES
+# =====================================================
+
+def _generate_otp():
+    """Return a cryptographically secure 6-digit numeric string."""
+    return f"{secrets.randbelow(1000000):06d}"
+
+
+def _get_client_ip():
+    """Extract client IP safely from request.remote_addr (configured with ProxyFix)."""
+    return request.remote_addr or "127.0.0.1"
+
+
+def _send_otp_email(to_email, otp):
+    """Deliver a 6-digit OTP code to the recipient's email address.
+
+    Uses Python's standard smtplib and EmailMessage modules so no external
+    dependencies are required. Never logs passwords, API keys, or plaintext OTPs.
+    """
+    global _email_sender_hook
+    if _email_sender_hook is not None:
+        return _email_sender_hook(to_email, otp)
+
+    if app.config.get("TESTING"):
+        return True
+
+    if not SMTP_SERVER:
+        app.logger.warning("[SMTP] SMTP_SERVER not configured; email delivery skipped.")
+        return False
+
+    msg = EmailMessage()
+    msg["Subject"] = "Your Password Reset Verification Code - Ledger"
+    msg["From"] = MAIL_DEFAULT_SENDER
+    msg["To"] = to_email
+
+    text_content = (
+        "Hello,\n\n"
+        "We received a request to reset your password for your Expense Tracker account.\n"
+        f"Your 6-digit verification code is: {otp}\n\n"
+        f"This code will expire in {OTP_EXPIRY_MINUTES} minutes.\n\n"
+        "If you did not request this code, please ignore this email. Your password will remain unchanged.\n\n"
+        "— Expense Tracker Team\n"
+    )
+    html_content = f"""<!DOCTYPE html>
+<html>
+<body style="font-family: system-ui, -apple-system, sans-serif; background-color: #0F1712; padding: 24px; color: #1E2A22;">
+  <div style="max-width: 480px; margin: 0 auto; background-color: #F4EFE0; padding: 32px; border-radius: 8px;">
+    <h2 style="margin-top: 0; color: #1E2A22;">Password Reset Verification</h2>
+    <p style="color: #4A5A4E; line-height: 1.5;">We received a request to reset your password for your Expense Tracker account.</p>
+    <p style="color: #4A5A4E; line-height: 1.5;">Use the following 6-digit verification code to complete your password reset:</p>
+    <div style="text-align: center; margin: 28px 0;">
+      <span style="display: inline-block; font-size: 32px; font-weight: 700; letter-spacing: 6px; padding: 12px 24px; background: #1E2A22; color: #F4EFE0; border-radius: 6px;">
+        {otp}
+      </span>
+    </div>
+    <p style="color: #4A5A4E; font-size: 0.9em; line-height: 1.4;">
+      This code is valid for <strong>{OTP_EXPIRY_MINUTES} minutes</strong>.
+      If you did not request a password reset, you can safely ignore this email; your account remains secure.
+    </p>
+    <hr style="border: none; border-top: 1px solid #D9D0B7; margin: 24px 0;">
+    <p style="color: #6C7A70; font-size: 0.8em; margin-bottom: 0;">— Expense Tracker Team</p>
+  </div>
+</body>
+</html>"""
+
+    msg.set_content(text_content)
+    msg.add_alternative(html_content, subtype="html")
+
+    try:
+        if SMTP_USE_SSL:
+            server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=SMTP_TIMEOUT)
+        else:
+            server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=SMTP_TIMEOUT)
+        with server:
+            if SMTP_USE_TLS and not SMTP_USE_SSL:
+                server.starttls()
+            if SMTP_USERNAME and SMTP_PASSWORD:
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+        return True
+    except Exception as exc:
+        app.logger.warning("[SMTP] Failed to deliver email: %s", type(exc).__name__)
+        return False
+
+
+def _check_otp_rate_limits(cursor, email, ip_address):
+    """Enforce rate limits on password reset requests:
+    1. Per-email cooldown (e.g. 60 seconds)
+    2. Per-email maximum hourly requests (e.g. 5/hour)
+    3. Per-IP maximum hourly requests (e.g. 10/hour)
+    """
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    one_hour_ago = now - timedelta(hours=1)
+
+    # 1. Cooldown check (most recent request for this email)
+    cursor.execute(
+        """
+        SELECT created_at
+        FROM password_resets
+        WHERE email = %s
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (email,)
+    )
+    latest = cursor.fetchone()
+    if latest and latest.get("created_at"):
+        created_at = latest["created_at"]
+        if isinstance(created_at, datetime):
+            created_cmp = created_at.replace(tzinfo=None) if created_at.tzinfo else created_at
+            diff_seconds = (now - created_cmp).total_seconds()
+            if diff_seconds < OTP_RESEND_COOLDOWN_SECONDS:
+                remaining = max(1, int(OTP_RESEND_COOLDOWN_SECONDS - diff_seconds))
+                return False, f"Please wait {remaining} second(s) before requesting another code."
+
+    # 2. Hourly per-email check
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM password_resets
+        WHERE email = %s AND created_at >= %s
+        """,
+        (email, one_hour_ago)
+    )
+    email_count_row = cursor.fetchone()
+    if email_count_row and email_count_row["count"] >= MAX_OTP_HOURLY_EMAIL:
+        return False, "Too many password reset requests for this email. Please try again later."
+
+    # 3. Hourly per-IP check
+    if ip_address:
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM password_resets
+            WHERE ip_address = %s AND created_at >= %s
+            """,
+            (ip_address, one_hour_ago)
+        )
+        ip_count_row = cursor.fetchone()
+        if ip_count_row and ip_count_row["count"] >= MAX_OTP_HOURLY_IP:
+            return False, "Too many password reset requests from your network. Please try again later."
+
+    return True, ""
+
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    if current_user.is_authenticated:
+        return redirect(url_for("home"))
+
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        ip_address = _get_client_ip()
+
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or len(email) > 255:
+            flash("Enter a valid email address.", "error")
+            return render_template("forgot_password.html")
+
+        db = None
+        cursor = None
+        try:
+            db = get_db_connection()
+            cursor = db.cursor(dictionary=True)
+
+            allowed, rate_msg = _check_otp_rate_limits(cursor, email, ip_address)
+            if not allowed:
+                flash(rate_msg, "error")
+                return render_template("forgot_password.html")
+
+            cursor.execute(
+                "SELECT id, username, email FROM users WHERE email = %s LIMIT 1",
+                (email,)
+            )
+            user_row = cursor.fetchone()
+
+            if user_row:
+                user_id = user_row["id"]
+                otp = _generate_otp()
+                otp_hash = generate_password_hash(otp)
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                expires_at = now + timedelta(minutes=OTP_EXPIRY_MINUTES)
+
+                # Invalidate any prior active OTPs for this user
+                cursor.execute(
+                    "UPDATE password_resets SET is_used = 1 WHERE user_id = %s AND is_used = 0",
+                    (user_id,)
+                )
+
+                cursor.execute(
+                    """
+                    INSERT INTO password_resets
+                    (user_id, email, otp_hash, created_at, expires_at, attempts, is_used, ip_address)
+                    VALUES (%s, %s, %s, %s, %s, 0, 0, %s)
+                    """,
+                    (user_id, email, otp_hash, now, expires_at, ip_address)
+                )
+                db.commit()
+
+                _send_otp_email(email, otp)
+            else:
+                # Anti-enumeration: perform dummy hash computation to balance response timing
+                _ = generate_password_hash("dummy_enumeration_mitigation_hash")
+
+        except mysql.connector.Error:
+            if db is not None:
+                db.rollback()
+            flash("Unable to process request. Please try again.", "error")
+            return render_template("forgot_password.html")
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if db is not None:
+                db.close()
+
+        session["reset_email"] = email
+        flash("If an account with that email exists, a 6-digit verification code has been sent.", "info")
+        return redirect(url_for("reset_password"))
+
+    return render_template("forgot_password.html")
+
+
+@app.route("/reset-password", methods=["GET", "POST"])
+def reset_password():
+    if current_user.is_authenticated:
+        return redirect(url_for("home"))
+
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        otp = request.form.get("otp", "").strip()
+        password = request.form.get("password", "")
+        confirmation = request.form.get("password_confirmation", "")
+
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or len(email) > 255:
+            flash("Enter a valid email address.", "error")
+            return render_template("reset_password.html", email=email)
+
+        if not re.fullmatch(r"\d{6}", otp):
+            flash("Verification code must be exactly 6 digits.", "error")
+            return render_template("reset_password.html", email=email)
+
+        if len(password) < 8:
+            flash("Password must be at least 8 characters.", "error")
+            return render_template("reset_password.html", email=email)
+
+        if password != confirmation:
+            flash("Passwords do not match.", "error")
+            return render_template("reset_password.html", email=email)
+
+        db = None
+        cursor = None
+        try:
+            db = get_db_connection()
+            cursor = db.cursor(dictionary=True)
+
+            cursor.execute(
+                """
+                SELECT id, user_id, email, otp_hash, attempts, is_used, expires_at
+                FROM password_resets
+                WHERE email = %s AND is_used = 0
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (email,)
+            )
+            reset_row = cursor.fetchone()
+
+            if not reset_row:
+                flash("Invalid or expired verification code.", "error")
+                return render_template("reset_password.html", email=email)
+
+            reset_id = reset_row["id"]
+            user_id = reset_row["user_id"]
+            attempts = reset_row["attempts"]
+            expires_at = reset_row["expires_at"]
+
+            # Max attempts check
+            if attempts >= MAX_OTP_ATTEMPTS:
+                cursor.execute("UPDATE password_resets SET is_used = 1 WHERE id = %s", (reset_id,))
+                db.commit()
+                flash("Maximum verification attempts exceeded. Please request a new code.", "error")
+                return redirect(url_for("forgot_password"))
+
+            # Expiry check
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if isinstance(expires_at, datetime):
+                expires_cmp = expires_at.replace(tzinfo=None) if expires_at.tzinfo else expires_at
+                is_expired = now > expires_cmp
+            else:
+                is_expired = False
+
+            if is_expired:
+                cursor.execute("UPDATE password_resets SET is_used = 1 WHERE id = %s", (reset_id,))
+                db.commit()
+                flash("This verification code has expired. Please request a new one.", "error")
+                return redirect(url_for("forgot_password"))
+
+            # Verify OTP
+            if not check_password_hash(reset_row["otp_hash"], otp):
+                cursor.execute(
+                    "UPDATE password_resets SET attempts = attempts + 1 WHERE id = %s AND is_used = 0",
+                    (reset_id,)
+                )
+                db.commit()
+                cursor.execute(
+                    "SELECT attempts FROM password_resets WHERE id = %s",
+                    (reset_id,)
+                )
+                att_row = cursor.fetchone()
+                current_attempts = att_row["attempts"] if att_row else (attempts + 1)
+
+                if current_attempts >= MAX_OTP_ATTEMPTS:
+                    cursor.execute(
+                        "UPDATE password_resets SET is_used = 1 WHERE id = %s",
+                        (reset_id,)
+                    )
+                    db.commit()
+                    flash("Maximum verification attempts exceeded. Please request a new code.", "error")
+                    return redirect(url_for("forgot_password"))
+
+                remaining = MAX_OTP_ATTEMPTS - current_attempts
+                flash(f"Invalid verification code. You have {remaining} attempt(s) remaining.", "error")
+                return render_template("reset_password.html", email=email)
+
+            # OTP verified successfully!
+            # Atomically consume OTP with conditional update to prevent concurrency race
+            cursor.execute(
+                "UPDATE password_resets SET is_used = 1 WHERE id = %s AND is_used = 0",
+                (reset_id,)
+            )
+            if cursor.rowcount != 1:
+                db.rollback()
+                flash("Invalid or expired verification code.", "error")
+                return render_template("reset_password.html", email=email)
+
+            new_password_hash = generate_password_hash(password)
+            cursor.execute(
+                "UPDATE users SET password_hash = %s WHERE id = %s",
+                (new_password_hash, user_id)
+            )
+            cursor.execute(
+                "UPDATE password_resets SET is_used = 1 WHERE user_id = %s AND is_used = 0",
+                (user_id,)
+            )
+            db.commit()
+
+            session.pop("reset_email", None)
+            flash("Password reset successfully. You can now sign in with your new password.", "success")
+            return redirect(url_for("login"))
+
+        except mysql.connector.Error:
+            if db is not None:
+                db.rollback()
+            flash("Unable to reset password. Please try again.", "error")
+            return render_template("reset_password.html", email=email)
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if db is not None:
+                db.close()
+
+    email = request.args.get("email", "").strip().lower() or session.get("reset_email", "")
+    return render_template("reset_password.html", email=email)
 
 # =====================================================
 # HOME / DASHBOARD

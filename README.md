@@ -89,9 +89,32 @@ CREATE TABLE expenses (
     CONSTRAINT fk_expenses_user
         FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
+
+CREATE TABLE password_resets (
+    id          INT NOT NULL AUTO_INCREMENT,
+    user_id     INT NOT NULL,
+    email       VARCHAR(255) NOT NULL,
+    otp_hash    VARCHAR(255) NOT NULL,
+    created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at  TIMESTAMP NOT NULL,
+    attempts    INT NOT NULL DEFAULT 0,
+    is_used     TINYINT(1) NOT NULL DEFAULT 0,
+    ip_address  VARCHAR(45) NULL,
+    PRIMARY KEY (id),
+    KEY idx_resets_user_id (user_id),
+    KEY idx_resets_email (email),
+    KEY idx_resets_expires (expires_at),
+    CONSTRAINT fk_resets_user
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB;
 ```
 
-Connection details come from environment variables only — no credentials are stored
+To migrate an existing database with the `password_resets` table, run:
+```bash
+python migrate_password_resets.py
+```
+
+Connection details and email settings come from environment variables only — no credentials are stored
 in the repository:
 
 | Variable | Required | Description |
@@ -104,6 +127,15 @@ in the repository:
 | `SECRET_KEY` | Production | Flask session key; a random one is generated in development |
 | `FLASK_ENV` | No | Set to `production` to enable production settings |
 | `FLASK_DEBUG` | No | Set to `1` to enable debug mode |
+| `SMTP_SERVER` | Production | SMTP server host (e.g. `smtp.gmail.com`, `smtp.sendgrid.net`) |
+| `SMTP_PORT` | No | SMTP port (defaults to `587`) |
+| `SMTP_USERNAME` | Production | SMTP authentication username / email |
+| `SMTP_PASSWORD` | Production | SMTP authentication password / app key |
+| `SMTP_USE_TLS` | No | Enable STARTTLS (defaults to `1` / true) |
+| `SMTP_USE_SSL` | No | Enable SSL direct connection (defaults to `0` / false) |
+| `MAIL_DEFAULT_SENDER` | No | Outgoing email sender (defaults to `Expense Tracker <noreply@expensetracker.local>`) |
+| `OTP_EXPIRY_MINUTES` | No | OTP validity duration (defaults to `10` minutes) |
+| `MAX_OTP_ATTEMPTS` | No | Max invalid OTP attempts before lockout (defaults to `5`) |
 
 ## Local Setup
 
