@@ -291,7 +291,11 @@ def get_user_by_id(user_id):
 
 @login_manager.user_loader
 def load_user(user_id):
-    user = get_user_by_id(user_id)
+    try:
+        user = get_user_by_id(user_id)
+    except mysql.connector.Error:
+        app.logger.warning("[Auth] Database unavailable during session load; logging user out.")
+        return None
     if user is None:
         return None
     sig = session.get("_password_hash_sig")
@@ -325,7 +329,12 @@ def login():
                 (identity, identity),
             )
             row = cursor.fetchone()
-        except mysql.connector.Error:
+        except mysql.connector.Error as exc:
+            app.logger.warning(
+                "[Auth] Login database error: %s - %s",
+                type(exc).__name__,
+                str(exc),
+            )
             if db is not None:
                 db.rollback()
             flash("Unable to sign in. Please try again.", "error")
@@ -389,7 +398,12 @@ def register():
                     login_user(User(user_id, username, email, pwd_hash))
                     session["_password_hash_sig"] = _hash_sig(pwd_hash)
                     return redirect(url_for("home"))
-            except mysql.connector.Error:
+            except mysql.connector.Error as exc:
+                app.logger.warning(
+                    "[Auth] Register database error: %s - %s",
+                    type(exc).__name__,
+                    str(exc),
+                )
                 db.rollback()
                 flash("Unable to create the account. Please try again.", "error")
             finally:
@@ -605,7 +619,12 @@ def forgot_password():
                 # Anti-enumeration: perform dummy hash computation to balance response timing
                 _ = generate_password_hash("dummy_enumeration_mitigation_hash")
 
-        except mysql.connector.Error:
+        except mysql.connector.Error as exc:
+            app.logger.warning(
+                "[Auth] Forgot-password database error: %s - %s",
+                type(exc).__name__,
+                str(exc),
+            )
             if db is not None:
                 db.rollback()
             flash("Unable to process request. Please try again.", "error")
@@ -751,7 +770,12 @@ def reset_password():
             flash("Password reset successfully. You can now sign in with your new password.", "success")
             return redirect(url_for("login"))
 
-        except mysql.connector.Error:
+        except mysql.connector.Error as exc:
+            app.logger.warning(
+                "[Auth] Reset-password database error: %s - %s",
+                type(exc).__name__,
+                str(exc),
+            )
             if db is not None:
                 db.rollback()
             flash("Unable to reset password. Please try again.", "error")
